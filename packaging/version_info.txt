@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 7, 9, 0),
-    prodvers=(1, 7, 9, 0),
+    filevers=(1, 7, 10, 0),
+    prodvers=(1, 7, 10, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -14,11 +14,11 @@ VSVersionInfo(
       StringTable("080404B0", [
         StringStruct("CompanyName", "Innei"),
         StringStruct("FileDescription", "Yohaku Companion Windows"),
-        StringStruct("FileVersion", "1.7.9"),
+        StringStruct("FileVersion", "1.7.10"),
         StringStruct("InternalName", "YohakuCompanion"),
         StringStruct("OriginalFilename", "YohakuCompanion.exe"),
         StringStruct("ProductName", "Yohaku Companion"),
-        StringStruct("ProductVersion", "1.7.9"),
+        StringStruct("ProductVersion", "1.7.10"),
       ])
     ]),
     VarFileInfo([VarStruct("Translation", [2052, 1200])]),

@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from .domain import RuleCandidate, SanitizedPresenceSnapshot
 from .media_capture import MediaProvider
 from .privacy import PrivacyEvaluator, sanitize_application, sanitize_media
 from .storage import StateStore
 from .win32_capture import ApplicationProvider
+
+if TYPE_CHECKING:
+    from .vrchat import VRChatActivityState
+
+privacy_log = logging.getLogger("yohaku.隐私")
 
 
 class PresenceCapture:
@@ -19,11 +26,13 @@ class PresenceCapture:
         store: StateStore,
         applications: ApplicationProvider,
         media: MediaProvider,
+        vrchat_activity: VRChatActivityState | None = None,
         on_candidates_changed: Callable[[tuple[RuleCandidate, ...]], None] | None = None,
     ) -> None:
         self._store = store
         self._applications = applications
         self._media = media
+        self._vrchat_activity = vrchat_activity
         self._candidates: dict[str, RuleCandidate] = {}
         self._on_candidates_changed = on_candidates_changed
         self._lock = asyncio.Lock()
@@ -78,10 +87,21 @@ class PresenceCapture:
                 decision = evaluator.application_decision(raw_application.identifier)
                 title = None
                 if sources.window_titles and decision.shares_window_title:
-                    title = await asyncio.to_thread(
-                        self._applications.read_window_title,
-                        raw_application.window_handle,
-                    )
+                    title = decision.custom_title
+                    if title is None:
+                        vrchat = self._store.load_vrchat_settings()
+                        if (
+                            raw_application.identifier.casefold() == "win32:vrchat.exe"
+                            and vrchat.enabled
+                            and vrchat.replace_world_title
+                            and self._vrchat_activity is not None
+                        ):
+                            title = self._vrchat_activity.world_name()
+                        if title is None:
+                            title = await asyncio.to_thread(
+                                self._applications.read_window_title,
+                                raw_application.window_handle,
+                            )
                 application = evaluator.filter_application(
                     sanitize_application(raw_application, title, sources, decision)
                 )
@@ -102,6 +122,10 @@ class PresenceCapture:
                     )
                 )
             self._last_filter_timed_out = bool(evaluator.timed_out_rule_names)
+            if self._last_filter_timed_out:
+                privacy_log.warning(
+                    "敏感词规则执行超时；受影响字段已 fail-closed 隐藏"
+                )
             return SanitizedPresenceSnapshot(datetime.now(UTC), application, media)
 
     def reset_media_continuity(self) -> None:

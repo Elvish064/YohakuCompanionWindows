@@ -4,13 +4,21 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QDialogButtonBox, QLineEdit
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialogButtonBox,
+    QHeaderView,
+    QLineEdit,
+    QTableWidget,
+    QTabWidget,
+)
 
 from tests.helpers import DEVICE_ID
 from tests.test_service import Credentials, Media
 from yohaku_companion_windows.capture import PresenceCapture
 from yohaku_companion_windows.domain import (
     ConnectionMetadata,
+    RuleCandidate,
     RuntimeState,
     SensitiveField,
     SensitivePatternKind,
@@ -18,11 +26,12 @@ from yohaku_companion_windows.domain import (
     ShareMode,
 )
 from yohaku_companion_windows.identity import AppIdentity
+from yohaku_companion_windows.logging_service import ProcessLogService
 from yohaku_companion_windows.sensitive_rules_ui import SensitiveRuleEditor
 from yohaku_companion_windows.service import ApplicationService
 from yohaku_companion_windows.startup import StartupManager
 from yohaku_companion_windows.storage import StateStore
-from yohaku_companion_windows.ui import SettingsWindow, TrayController, _mode_combo
+from yohaku_companion_windows.ui import LogPanel, SettingsWindow, TrayController, _mode_combo
 from yohaku_companion_windows.visuals import status_icon
 from yohaku_companion_windows.win32_capture import ApplicationProvider
 
@@ -33,6 +42,20 @@ class NoApplication(ApplicationProvider):
 
     def read_window_title(self, window_handle: int):  # type: ignore[no-untyped-def]
         raise AssertionError("title must not be read")
+
+
+class VRChatCredentials:
+    def __init__(self) -> None:
+        self.value: str | None = None
+
+    async def get_api_key(self) -> str | None:
+        return self.value
+
+    async def set_api_key(self, value: str) -> None:
+        self.value = value
+
+    async def delete_api_key(self) -> None:
+        self.value = None
 
 
 def test_chinese_pairing_and_paired_states_hide_sensitive_values(
@@ -181,6 +204,67 @@ async def test_dialog_accept_adds_rule_and_main_save_keeps_it_visible(
     await window._save_privacy()
     assert window._sensitive_table.rowCount() == 1
     assert store.load_sensitive_rules()[0].name == "保留规则"
+    window.begin_quit()
+    window.close()
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_vrchat_and_log_tabs_hide_saved_key(
+    qtbot, tmp_path: Path  # type: ignore[no-untyped-def]
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    media = Media()
+    logs = ProcessLogService(tmp_path / "logs")
+    vr_credentials = VRChatCredentials()
+    vr_credentials.value = "never-visible-vrc-key"
+    service = ApplicationService(
+        store,
+        Credentials(),
+        PresenceCapture(store, NoApplication(), media),
+        media,
+        vrchat_credentials=vr_credentials,
+        logs=logs,
+    )
+    service.state.connection = ConnectionMetadata(
+        "https://example.com", DEVICE_ID, (), 0, False
+    )
+    service.state.vrchat_api_key_present = True
+    service.state.rule_candidates = (
+        RuleCandidate("win32:browser.exe", "Browser"),
+    )
+    window = SettingsWindow(
+        service,
+        StartupManager(AppIdentity("dev.innei.YohakuCompanion.windows.debug")),
+        QIcon(),
+    )
+    qtbot.addWidget(window)
+    window.render_state(service.state)
+    tab_names = [
+        tabs.tabText(index)
+        for tabs in window.findChildren(QTabWidget)
+        for index in range(tabs.count())
+    ]
+    assert "VRChat 集成" in tab_names
+    assert "日志" in tab_names
+    log_panels = window.findChildren(LogPanel)
+    assert log_panels
+    assert all(not panel.vrchat_debug_logging.isChecked() for panel in log_panels)
+    assert window._vr_api_key.echoMode() is QLineEdit.EchoMode.Password
+    assert window._vr_api_key.text() == ""
+    assert "已保存" in window._vr_api_key.placeholderText()
+    line_edit_text = " ".join(item.text() for item in window.findChildren(QLineEdit))
+    assert "never-visible-vrc-key" not in line_edit_text
+    assert window._rules.horizontalHeaderItem(6).text() == "自定义标题"
+    window._rules.item(0, 6).setText("固定公开标题")
+    await window._save_privacy()
+    assert store.load_rules()[0].custom_title == "固定公开标题"
+    for table in window.findChildren(QTableWidget):
+        header = table.horizontalHeader()
+        assert all(
+            header.sectionResizeMode(column) is QHeaderView.ResizeMode.Interactive
+            for column in range(table.columnCount())
+        )
     window.begin_quit()
     window.close()
     store.close()

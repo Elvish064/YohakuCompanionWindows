@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from uuid import uuid4
@@ -21,6 +22,8 @@ from .protocol import (
     parse_wire_timestamp,
 )
 from .storage import StateStore
+
+network_log = logging.getLogger("yohaku.网络")
 
 
 class PayloadTooLarge(RuntimeError):
@@ -51,6 +54,7 @@ class PresenceWriter:
                 self._metadata.device_id, self._metadata.pairing_next_sequence
             )
             request_id = str(uuid4())
+            network_log.debug("预留 Presence 序列=%d 请求ID=%s", sequence, request_id)
             request = make_presence_request(
                 snapshot,
                 self._metadata.device_id,
@@ -68,6 +72,7 @@ class PresenceWriter:
                 self._metadata.device_id, self._metadata.pairing_next_sequence
             )
             request_id = str(uuid4())
+            network_log.debug("预留清除序列=%d 请求ID=%s", sequence, request_id)
             request = make_clear_request(
                 reason, observed_at, self._metadata.device_id, sequence, request_id
             )
@@ -92,6 +97,7 @@ class PresenceWriter:
                 raise
             result = await self._retry(operation)
         except (TransportFailure, ProtocolError):
+            network_log.warning("请求结果不明确，使用相同请求执行一次幂等重试")
             result = await self._retry(operation)
         self._store.reconcile_sequence(self._metadata.device_id, result.accepted_sequence)
         server_time = parse_wire_timestamp(

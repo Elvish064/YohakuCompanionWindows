@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -19,6 +20,9 @@ from .protocol import (
 )
 from .storage import StateStore
 from .writer import PresenceWriter
+
+presence_log = logging.getLogger("yohaku.Presence")
+network_log = logging.getLogger("yohaku.网络")
 
 
 class LiveDeskCoordinator:
@@ -122,6 +126,7 @@ class LiveDeskCoordinator:
                 client = CompanionHTTPClient(ServerConfiguration(metadata.base_url))
                 self._client = client
                 capabilities = await client.fetch_capabilities()
+                network_log.info("能力协商完成")
                 configuration = negotiate_presence(capabilities, APP_VERSION)
                 validate_clock_skew(
                     capabilities.server_time,
@@ -140,9 +145,14 @@ class LiveDeskCoordinator:
                 self._set_state(state)
                 await self._delay_or_refresh(300)
                 continue
-            except Exception:
+            except Exception as error:
                 await self._discard_client()
                 self._set_state(RuntimeState.DEGRADED)
+                network_log.warning(
+                    "连接协商失败：%s：%s",
+                    type(error).__name__,
+                    str(error) or "无详细信息",
+                )
                 await self._delay_or_refresh(30)
                 continue
 
@@ -182,6 +192,12 @@ class LiveDeskCoordinator:
                         assert self._writer is not None
                         last_sent = time.monotonic()
                         await self._writer.replace(snapshot)
+                        presence_log.info(
+                            "Presence 已上报：可见性=%s 应用=%s 媒体=%s",
+                            snapshot.availability.value,
+                            "分享" if snapshot.application is not None else "隐藏",
+                            "分享" if snapshot.media is not None else "隐藏",
+                        )
                         if self._on_published_snapshot is not None:
                             self._on_published_snapshot(snapshot)
                         last_heartbeat = last_sent
@@ -192,8 +208,9 @@ class LiveDeskCoordinator:
                 return
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as error:
                 self._set_state(RuntimeState.DEGRADED)
+                network_log.warning("Presence 连接中断：%s", type(error).__name__)
                 await self._discard_client()
                 await self._delay_or_refresh(30)
 

@@ -124,6 +124,55 @@ class SourceSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class VRChatIntegrationSettings:
+    enabled: bool = False
+    replace_world_title: bool = True
+    upload_activity: bool = True
+    endpoint_url: str = ""
+
+    def to_dict(self) -> dict[str, bool | str]:
+        return {
+            "enabled": self.enabled,
+            "replaceWorldTitle": self.replace_world_title,
+            "uploadActivity": self.upload_activity,
+            "endpointURL": self.endpoint_url.strip(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> VRChatIntegrationSettings:
+        endpoint = value.get("endpointURL", "")
+        if not isinstance(endpoint, str):
+            raise ValueError("invalid VRChat endpoint")
+        return cls(
+            enabled=_stored_bool(value, "enabled", False),
+            replace_world_title=_stored_bool(value, "replaceWorldTitle", True),
+            upload_activity=_stored_bool(value, "uploadActivity", True),
+            endpoint_url=endpoint.strip(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LoggingSettings:
+    file_enabled: bool = False
+    vrchat_debug_enabled: bool = False
+
+    def to_dict(self) -> dict[str, bool]:
+        return {
+            "fileEnabled": self.file_enabled,
+            "vrchatDebugEnabled": self.vrchat_debug_enabled,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> LoggingSettings:
+        return cls(
+            file_enabled=_stored_bool(value, "fileEnabled", False),
+            vrchat_debug_enabled=_stored_bool(
+                value, "vrchatDebugEnabled", False
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PrivacyDefaults:
     application: bool = True
     window_title: bool = False
@@ -153,6 +202,7 @@ class ApplicationRule:
     window_title: ShareMode = ShareMode.INHERIT
     media: ShareMode = ShareMode.INHERIT
     alias: str | None = None
+    custom_title: str | None = None
 
     def normalized(self) -> ApplicationRule:
         identifier = unicodedata.normalize("NFC", self.identifier.strip()).casefold()
@@ -164,6 +214,7 @@ class ApplicationRule:
             window_title=self.window_title,
             media=self.media,
             alias=normalize_text(self.alias, 120),
+            custom_title=normalize_text(self.custom_title, 500),
         )
 
 
@@ -430,6 +481,11 @@ class ServiceViewState:
     busy: bool = False
     notice: str | None = None
     rule_candidates: tuple[RuleCandidate, ...] = field(default_factory=tuple)
+    vrchat_settings: VRChatIntegrationSettings = field(
+        default_factory=VRChatIntegrationSettings
+    )
+    vrchat_api_key_present: bool = False
+    vrchat_status: str = "未启用"
 
 
 def _stored_bool(value: dict[str, Any], key: str, fallback: bool) -> bool:

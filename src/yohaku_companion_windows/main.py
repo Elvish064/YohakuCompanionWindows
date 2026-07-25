@@ -38,14 +38,16 @@ def _gui_main(background: bool) -> int:
     from qasync import QEventLoop
 
     from .capture import PresenceCapture
-    from .credentials import WindowsCredentialStore
+    from .credentials import WindowsCredentialStore, WindowsVRChatCredentialStore
     from .lifecycle import WindowsLifecycleMonitor
+    from .logging_service import ProcessLogService
     from .media_capture import WinRTMediaProvider
     from .service import ApplicationService
     from .single_instance import SingleInstance
     from .startup import StartupManager
     from .storage import StateStore
     from .ui import SettingsWindow, TrayController
+    from .vrchat import VRChatActivityState, VRChatIntegration
     from .win32_capture import Win32ApplicationProvider
 
     app = QApplication(sys.argv)
@@ -67,10 +69,31 @@ def _gui_main(background: bool) -> int:
         return 0
 
     store = StateStore(identity.database_path)
+    logs = ProcessLogService(identity.data_directory / "logs")
+    logs.install()
+    logging_settings = store.load_logging_settings()
+    logs.set_file_enabled(logging_settings.file_enabled)
+    logs.set_vrchat_debug_enabled(logging_settings.vrchat_debug_enabled)
     credentials = WindowsCredentialStore(identity.credential_service)
+    vrchat_credentials = WindowsVRChatCredentialStore(identity.credential_service)
     media = WinRTMediaProvider()
-    capture = PresenceCapture(store, Win32ApplicationProvider(), media)
-    service = ApplicationService(store, credentials, capture, media)
+    vrchat_activity = VRChatActivityState()
+    capture = PresenceCapture(
+        store,
+        Win32ApplicationProvider(),
+        media,
+        vrchat_activity=vrchat_activity,
+    )
+    vrchat = VRChatIntegration(vrchat_activity)
+    service = ApplicationService(
+        store,
+        credentials,
+        capture,
+        media,
+        vrchat_credentials,
+        vrchat,
+        logs,
+    )
     monitor = WindowsLifecycleMonitor(service.handle_suspend, service.handle_resume)
     service.set_lifecycle_available(monitor.install())
     startup = StartupManager(identity)
@@ -122,7 +145,11 @@ def _self_test() -> int:
             raise RuntimeError("x64 is required")
         import httpx  # noqa: F401
         import keyring  # noqa: F401
+        import pywintypes  # noqa: F401
         import qasync  # noqa: F401
+        import win32file  # noqa: F401
+        import win32pipe  # noqa: F401
+        from anyio._backends._asyncio import AsyncIOBackend  # noqa: F401
         from PySide6 import QtCore  # noqa: F401
         from winrt.windows.media.control import (  # noqa: F401
             GlobalSystemMediaTransportControlsSessionManager,
@@ -131,6 +158,7 @@ def _self_test() -> int:
         from .domain import PresenceConfiguration, SanitizedPresenceSnapshot
         from .protocol import encode_json, make_presence_request
         from .storage import StateStore
+        from .vrchat import decode_rpc_frame, encode_rpc_frame
 
         configuration = PresenceConfiguration(32_768, 60, 30, 120, 60, 60, True)
         snapshot = SanitizedPresenceSnapshot(datetime.now(UTC), None, None)
@@ -144,6 +172,12 @@ def _self_test() -> int:
         )
         if b'"application":null' not in payload or b'"media":null' not in payload:
             raise RuntimeError("protocol null fields are missing")
+        if decode_rpc_frame(encode_rpc_frame(3, {"nonce": "probe"})) != (
+            3,
+            {"nonce": "probe"},
+        ):
+            raise RuntimeError("Discord RPC frame codec failed")
+        asyncio.run(_verify_httpx_loopback())
         with tempfile.TemporaryDirectory(prefix="yohaku-self-test-") as directory:
             state = StateStore(Path(directory) / "state.sqlite3")
             state.close()
@@ -152,6 +186,13 @@ def _self_test() -> int:
             raise RuntimeError("Windows Credential Locker backend is unavailable")
         _verify_windows_keyring(backend)
     except Exception as error:
+        report_path = os.environ.get("YOHAKU_SELF_TEST_REPORT")
+        if report_path:
+            with suppress(Exception):
+                Path(report_path).write_text(
+                    f"{type(error).__name__}: {error}",
+                    encoding="utf-8",
+                )
         print(f"SELF-TEST FAILED: {error}")
         return 1
     print(f"SELF-TEST OK: Yohaku Companion Windows {APP_VERSION}")
@@ -162,6 +203,45 @@ def _windows_keyring_backend() -> Any:
     from keyring.backends.Windows import WinVaultKeyring
 
     return WinVaultKeyring()
+
+
+async def _verify_httpx_loopback() -> None:
+    """Exercise HTTPX/AnyIO's dynamic asyncio backend in the frozen app."""
+    import httpx
+
+    async def respond(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(
+                b"HTTP/1.1 204 No Content\r\n"
+                b"Content-Length: 0\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(respond, "127.0.0.1", 0)
+    try:
+        sockets = server.sockets
+        if not sockets:
+            raise RuntimeError("loopback test server failed to bind")
+        port = int(sockets[0].getsockname()[1])
+        async with httpx.AsyncClient(
+            timeout=5.0,
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            response = await client.get(f"http://127.0.0.1:{port}/self-test")
+        if response.status_code != 204:
+            raise RuntimeError("HTTPX loopback request failed")
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 def _verify_windows_keyring(backend: Any) -> None:

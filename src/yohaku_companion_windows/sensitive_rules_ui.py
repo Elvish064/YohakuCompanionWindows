@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from uuid import uuid4
 
 import regex
@@ -221,7 +222,11 @@ class SensitiveRuleEditor(QDialog):
         }
         self.module_value.setEnabled(needs_value)
         self.module_value.setPlaceholderText(
-            "文字；多个关键词可用逗号分隔"
+            (
+                "多个词可用 ,，、换行或 | 分隔"
+                if kind is SensitivePatternKind.ANY_WORD
+                else "请输入完整文字"
+            )
             if needs_value
             else "该模块无需填写内容"
         )
@@ -303,11 +308,13 @@ def _module_pattern(module: SensitivePatternModule) -> str:
     if kind is SensitivePatternKind.SUFFIX:
         return rf"(?:{escaped})\Z"
     if kind is SensitivePatternKind.ANY_WORD:
-        words = [
-            word.strip()
-            for word in regex.split(r"[,，|\n]+", module.value)
-            if word.strip()
-        ]
+        words: list[str] = []
+        seen: set[str] = set()
+        for raw_word in regex.split(r"[,，、|\r\n]+", module.value):
+            word = unicodedata.normalize("NFC", raw_word.strip())
+            if word and word not in seen:
+                words.append(word)
+                seen.add(word)
         if not words:
             raise ValueError("请输入至少一个关键词")
         return "(?:" + "|".join(regex.escape(word) for word in words) + ")"

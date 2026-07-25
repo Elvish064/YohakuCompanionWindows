@@ -142,7 +142,7 @@ class CompanionHTTPClient:
         extra_headers: dict[str, str] | None,
         body: bytes | None,
     ) -> HTTPResponse:
-        await _verify_transport_address(self.server.base_url)
+        await verify_transport_address(self.server.base_url)
         headers = {
             "Accept": "application/json",
             # Core blocks generic crawler UAs such as python-httpx.  Identify
@@ -166,7 +166,7 @@ class CompanionHTTPClient:
         return response
 
 
-async def _verify_transport_address(base_url: str) -> None:
+async def verify_transport_address(base_url: str) -> None:
     """Prevent plaintext credentials from leaving the local network."""
     parsed = urlsplit(base_url)
     if parsed.scheme.casefold() != "http":
@@ -193,6 +193,10 @@ async def _verify_transport_address(base_url: str) -> None:
     addresses = {str(record[4][0]).split("%", 1)[0] for record in records}
     if not addresses or any(lan_address_literal(address) is not True for address in addresses):
         raise ProtocolError("HTTP 主机必须只解析到私有或链路本地 IP")
+
+
+# Backward-compatible private name retained for existing callers and tests.
+_verify_transport_address = verify_transport_address
 
 
 def _decode_response(response: HTTPResponse) -> dict[str, Any]:

@@ -29,12 +29,20 @@ class ApplicationDecision:
     shares_application: bool
     shares_window_title: bool
     alias: str | None
+    custom_title: str | None
 
 
 @dataclass(frozen=True, slots=True)
 class MediaDecision:
     shares_media: bool
     alias: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SensitiveTextResult:
+    value: str | None
+    hide_context: bool
+    timed_out: bool
 
 
 class PrivacyEvaluator:
@@ -77,6 +85,11 @@ class PrivacyEvaluator:
                 None
                 if not shares_application or rule is None
                 else normalize_text(rule.alias, 120)
+            ),
+            custom_title=(
+                None
+                if not shares_window or rule is None
+                else normalize_text(rule.custom_title, 500)
             ),
         )
 
@@ -138,6 +151,25 @@ class PrivacyEvaluator:
             album=fields[SensitiveField.MEDIA_ALBUM],
             player_display_name=fields[SensitiveField.PLAYER_NAME],
             playback=value.playback,
+        )
+
+    def filter_text(
+        self,
+        value: str | None,
+        field: SensitiveField,
+        maximum: int = 500,
+    ) -> SensitiveTextResult:
+        """Apply the same compiled sensitive policy to an integration text field."""
+        normalized = normalize_text(value, maximum)
+        if normalized is None:
+            return SensitiveTextResult(None, False, False)
+        fields: dict[SensitiveField, str | None] = {field: normalized}
+        before = len(self._timed_out_rule_names)
+        hide_context = self._filter_fields(fields, application_context=False)
+        return SensitiveTextResult(
+            fields[field],
+            hide_context,
+            len(self._timed_out_rule_names) != before,
         )
 
     def _filter_fields(

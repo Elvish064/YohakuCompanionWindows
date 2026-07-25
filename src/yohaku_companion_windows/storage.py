@@ -11,6 +11,7 @@ import regex
 from .domain import (
     ApplicationRule,
     ConnectionMetadata,
+    LoggingSettings,
     PrivacyDefaults,
     SensitiveAction,
     SensitiveField,
@@ -19,6 +20,7 @@ from .domain import (
     SensitiveTextRule,
     ShareMode,
     SourceSettings,
+    VRChatIntegrationSettings,
 )
 from .protocol import (
     MAXIMUM_SAFE_INTEGER,
@@ -55,7 +57,8 @@ class StateStore:
                     application TEXT NOT NULL,
                     window_title TEXT NOT NULL,
                     media TEXT NOT NULL,
-                    alias TEXT
+                    alias TEXT,
+                    custom_title TEXT
                 );
                 CREATE TABLE IF NOT EXISTS presence_sequences (
                     device_id TEXT PRIMARY KEY NOT NULL,
@@ -84,6 +87,16 @@ class StateStore:
                 self._connection.execute(
                     "ALTER TABLE privacy_regex_rules "
                     "ADD COLUMN pattern_modules TEXT NOT NULL DEFAULT '[]'"
+                )
+            privacy_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(privacy_rules)"
+                ).fetchall()
+            }
+            if "custom_title" not in privacy_columns:
+                self._connection.execute(
+                    "ALTER TABLE privacy_rules ADD COLUMN custom_title TEXT"
                 )
             self._connection.commit()
 
@@ -203,7 +216,8 @@ class StateStore:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT identifier, display_name, application, window_title, media, alias
+                SELECT identifier, display_name, application, window_title,
+                       media, alias, custom_title
                 FROM privacy_rules ORDER BY display_name COLLATE NOCASE, identifier
                 """
             ).fetchall()
@@ -216,6 +230,11 @@ class StateStore:
                     window_title=ShareMode(str(row["window_title"])),
                     media=ShareMode(str(row["media"])),
                     alias=None if row["alias"] is None else str(row["alias"]),
+                    custom_title=(
+                        None
+                        if row["custom_title"] is None
+                        else str(row["custom_title"])
+                    ),
                 ).normalized()
                 for row in rows
             )
@@ -230,14 +249,16 @@ class StateStore:
             self._connection.execute(
                 """
                 INSERT INTO privacy_rules(
-                    identifier, display_name, application, window_title, media, alias
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    identifier, display_name, application, window_title,
+                    media, alias, custom_title
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(identifier) DO UPDATE SET
                     display_name = excluded.display_name,
                     application = excluded.application,
                     window_title = excluded.window_title,
                     media = excluded.media,
-                    alias = excluded.alias
+                    alias = excluded.alias,
+                    custom_title = excluded.custom_title
                 """,
                 (
                     normalized.identifier,
@@ -246,6 +267,7 @@ class StateStore:
                     normalized.window_title.value,
                     normalized.media.value,
                     normalized.alias,
+                    normalized.custom_title,
                 ),
             )
 
@@ -258,8 +280,9 @@ class StateStore:
             self._connection.executemany(
                 """
                 INSERT INTO privacy_rules(
-                    identifier, display_name, application, window_title, media, alias
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    identifier, display_name, application, window_title,
+                    media, alias, custom_title
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -269,6 +292,7 @@ class StateStore:
                         rule.window_title.value,
                         rule.media.value,
                         rule.alias,
+                        rule.custom_title,
                     )
                     for rule in normalized
                 ],
@@ -367,8 +391,9 @@ class StateStore:
             self._connection.executemany(
                 """
                 INSERT INTO privacy_rules(
-                    identifier, display_name, application, window_title, media, alias
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    identifier, display_name, application, window_title,
+                    media, alias, custom_title
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -378,6 +403,7 @@ class StateStore:
                         rule.window_title.value,
                         rule.media.value,
                         rule.alias,
+                        rule.custom_title,
                     )
                     for rule in normalized
                 ],
@@ -429,6 +455,36 @@ class StateStore:
 
     def set_paused(self, paused: bool) -> None:
         self._write_metadata("live_desk.paused", "1" if paused else "0")
+
+    def load_vrchat_settings(self) -> VRChatIntegrationSettings:
+        raw = self._read_metadata("vrchat.integration.v1")
+        if raw is None:
+            return VRChatIntegrationSettings()
+        try:
+            decoded = json.loads(raw)
+            if not isinstance(decoded, dict):
+                raise ValueError
+            return VRChatIntegrationSettings.from_dict(decoded)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise StorageError("invalid VRChat integration settings") from error
+
+    def save_vrchat_settings(self, settings: VRChatIntegrationSettings) -> None:
+        self._write_metadata("vrchat.integration.v1", _json(settings.to_dict()))
+
+    def load_logging_settings(self) -> LoggingSettings:
+        raw = self._read_metadata("logging.settings.v1")
+        if raw is None:
+            return LoggingSettings()
+        try:
+            decoded = json.loads(raw)
+            if not isinstance(decoded, dict):
+                raise ValueError
+            return LoggingSettings.from_dict(decoded)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise StorageError("invalid logging settings") from error
+
+    def save_logging_settings(self, settings: LoggingSettings) -> None:
+        self._write_metadata("logging.settings.v1", _json(settings.to_dict()))
 
     def reserve_sequence(self, device_id: str, pairing_next_sequence: int) -> int:
         validate_identifier(device_id, "sequence.deviceId")

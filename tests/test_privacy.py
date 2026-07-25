@@ -112,6 +112,37 @@ async def test_both_global_and_application_rules_required_for_title(tmp_path: Pa
     store.close()
 
 
+@pytest.mark.asyncio
+async def test_custom_title_prevents_raw_read_and_is_sanitized(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    store.save_sources(SourceSettings(True, True, False))
+    store.save_privacy_defaults(PrivacyDefaults(True, True, False))
+    store.save_rule(
+        ApplicationRule(
+            "win32:secret.exe",
+            "Secret",
+            custom_title="机密固定标题",
+        )
+    )
+    store.replace_sensitive_rules(
+        (
+            SensitiveTextRule(
+                "123e4567-e89b-12d3-a456-426614174077",
+                "净化自定义标题",
+                "机密",
+                (SensitiveField.WINDOW_TITLE,),
+                SensitiveAction.MASK_MATCH,
+            ),
+        )
+    )
+    applications = ApplicationStub()
+    snapshot = await PresenceCapture(store, applications, MediaStub()).capture()
+    assert applications.title_reads == 0
+    assert snapshot.application is not None
+    assert snapshot.application.window_title == "•••固定标题"
+    store.close()
+
+
 def test_hide_overrides_alias_and_media_is_independent() -> None:
     evaluator = PrivacyEvaluator(
         PrivacyDefaults(True, False, True),
@@ -282,4 +313,38 @@ def test_sensitive_rule_storage_migrates_old_database_and_preserves_order(
     assert store.load_sensitive_rules()[0].pattern_modules == (
         SensitivePatternModule(SensitivePatternKind.CONTAINS, "one"),
     )
+    store.close()
+
+
+def test_application_rule_storage_migrates_custom_title_column(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    legacy = sqlite3.connect(path)
+    legacy.execute(
+        """
+        CREATE TABLE privacy_rules (
+            identifier TEXT PRIMARY KEY NOT NULL,
+            display_name TEXT NOT NULL,
+            application TEXT NOT NULL,
+            window_title TEXT NOT NULL,
+            media TEXT NOT NULL,
+            alias TEXT
+        )
+        """
+    )
+    legacy.execute(
+        "INSERT INTO privacy_rules VALUES (?, ?, ?, ?, ?, ?)",
+        ("win32:legacy.exe", "Legacy", "inherit", "inherit", "inherit", None),
+    )
+    legacy.commit()
+    legacy.close()
+    store = StateStore(path)
+    assert store.load_rules()[0].custom_title is None
+    store.save_rule(
+        ApplicationRule(
+            "win32:legacy.exe",
+            "Legacy",
+            custom_title="固定标题",
+        )
+    )
+    assert store.load_rules()[0].custom_title == "固定标题"
     store.close()

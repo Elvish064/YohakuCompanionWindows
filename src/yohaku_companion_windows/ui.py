@@ -5,8 +5,8 @@ from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QColor, QIcon
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 
 from .domain import (
     ApplicationRule,
+    LoggingSettings,
     PrivacyDefaults,
     RuntimeState,
     SensitiveAction,
@@ -42,7 +43,9 @@ from .domain import (
     ServiceViewState,
     ShareMode,
     SourceSettings,
+    VRChatIntegrationSettings,
 )
+from .logging_service import ProcessLogService
 from .sensitive_rules_ui import ACTION_NAMES, FIELD_NAMES, SensitiveRuleEditor
 from .service import ApplicationService
 from .startup import StartupManager
@@ -59,6 +62,173 @@ _STATE_NAMES = {
 }
 
 
+class LogPanel(QWidget):
+    def __init__(
+        self,
+        logs: ProcessLogService,
+        service: ApplicationService | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._logs = logs
+        self._service = service
+        self._render_signature: tuple[object, ...] | None = None
+        layout = QVBoxLayout(self)
+        filters = QHBoxLayout()
+        self.level_filter = QComboBox()
+        self.level_filter.addItems(["全部级别", "DEBUG", "INFO", "WARNING", "ERROR"])
+        self.category_filter = QComboBox()
+        self.category_filter.addItem("全部类别")
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索脱敏日志")
+        self.pause_refresh = QCheckBox("暂停刷新")
+        self.auto_scroll = QCheckBox("自动滚动")
+        self.auto_scroll.setChecked(True)
+        filters.addWidget(self.level_filter)
+        filters.addWidget(self.category_filter)
+        filters.addWidget(self.search_edit, 1)
+        filters.addWidget(self.pause_refresh)
+        filters.addWidget(self.auto_scroll)
+        layout.addLayout(filters)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["时间", "级别", "类别", "消息"])
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        _configure_resizable_header(self.table, (145, 85, 120, 420))
+        self.table.setAccessibleName("运行与上报日志")
+        layout.addWidget(self.table, 1)
+        actions = QHBoxLayout()
+        copy_button = QPushButton("复制所选")
+        copy_button.clicked.connect(self._copy_selected)
+        clear_button = QPushButton("清空内存日志")
+        clear_button.clicked.connect(self._clear)
+        open_button = QPushButton("打开日志目录")
+        open_button.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(logs.log_directory)))
+        )
+        actions.addWidget(copy_button)
+        actions.addWidget(clear_button)
+        actions.addWidget(open_button)
+        if service is not None:
+            logging_settings = service.store.load_logging_settings()
+            self.file_logging = QCheckBox("写入按日文件日志")
+            self.file_logging.setChecked(logging_settings.file_enabled)
+            self.vrchat_debug_logging = QCheckBox("记录 VRChat 调试日志")
+            self.vrchat_debug_logging.setToolTip(
+                "默认关闭。仅排查问题时开启；高频 Activity 不会逐条显示。"
+            )
+            self.vrchat_debug_logging.setChecked(
+                logging_settings.vrchat_debug_enabled
+            )
+            self.file_logging.toggled.connect(self._save_logging_settings)
+            self.vrchat_debug_logging.toggled.connect(self._save_logging_settings)
+            actions.addWidget(self.file_logging)
+            actions.addWidget(self.vrchat_debug_logging)
+        actions.addStretch()
+        layout.addLayout(actions)
+        self.level_filter.currentIndexChanged.connect(self.refresh)
+        self.category_filter.currentIndexChanged.connect(self.refresh)
+        self.search_edit.textChanged.connect(self.refresh)
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self.refresh)
+        self._timer.start()
+        self.refresh()
+
+    def refresh(self) -> None:
+        if self.pause_refresh.isChecked() or not self.isVisible():
+            return
+        entries = self._logs.entries()
+        categories = sorted({entry.category for entry in entries})
+        current_category = self.category_filter.currentText()
+        existing_categories = [
+            self.category_filter.itemText(i)
+            for i in range(1, self.category_filter.count())
+        ]
+        if existing_categories != categories:
+            self.category_filter.blockSignals(True)
+            self.category_filter.clear()
+            self.category_filter.addItem("全部类别")
+            self.category_filter.addItems(categories)
+            index = self.category_filter.findText(current_category)
+            self.category_filter.setCurrentIndex(max(0, index))
+            self.category_filter.blockSignals(False)
+        level = self.level_filter.currentText()
+        category = self.category_filter.currentText()
+        needle = self.search_edit.text().strip().casefold()
+        signature = (
+            entries[-1].sequence if entries else 0,
+            len(entries),
+            level,
+            category,
+            needle,
+        )
+        if signature == self._render_signature:
+            return
+        self._render_signature = signature
+        filtered = [
+            entry
+            for entry in entries
+            if (level == "全部级别" or entry.level == level)
+            and (category == "全部类别" or entry.category == category)
+            and (
+                not needle
+                or needle in entry.message.casefold()
+                or needle in entry.category.casefold()
+            )
+        ]
+        self.table.setRowCount(len(filtered))
+        for row, entry in enumerate(filtered):
+            values = (
+                entry.occurred_at.strftime("%Y-%m-%d %H:%M:%S"),
+                entry.level,
+                entry.category,
+                entry.message,
+            )
+            for column, value in enumerate(values):
+                self.table.setItem(row, column, QTableWidgetItem(value))
+        if self.auto_scroll.isChecked() and filtered:
+            self.table.scrollToBottom()
+
+    def _copy_selected(self) -> None:
+        rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        text = "\n".join(
+            "\t".join(_table_text(self.table, row, column) for column in range(4))
+            for row in rows
+        )
+        QApplication.clipboard().setText(text)
+
+    def _clear(self) -> None:
+        self._logs.clear()
+        self._render_signature = None
+        self.refresh()
+
+    def _save_logging_settings(self, _enabled: bool) -> None:
+        if self._service is not None:
+            asyncio.create_task(
+                self._service.save_logging_settings(
+                    LoggingSettings(
+                        self.file_logging.isChecked(),
+                        self.vrchat_debug_logging.isChecked(),
+                    )
+                )
+            )
+
+
+class LogWindow(QDialog):
+    def __init__(self, logs: ProcessLogService, service: ApplicationService) -> None:
+        super().__init__()
+        self.setWindowTitle("Yohaku Companion 日志")
+        self.resize(900, 560)
+        layout = QVBoxLayout(self)
+        layout.addWidget(LogPanel(logs, service, self))
+
+    def show_and_raise(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+
 class SettingsWindow(QMainWindow):
     def __init__(
         self,
@@ -72,6 +242,10 @@ class SettingsWindow(QMainWindow):
         self._quitting = False
         self._tasks: set[asyncio.Task[None]] = set()
         self._sensitive_rules = list(self.service.store.load_sensitive_rules())
+        self._log_window = (
+            LogWindow(service.logs, service) if service.logs is not None else None
+        )
+        self._vr_loaded_settings: VRChatIntegrationSettings | None = None
         self.setWindowTitle("Yohaku Companion Windows")
         self.setWindowIcon(icon)
         self.resize(820, 650)
@@ -95,6 +269,12 @@ class SettingsWindow(QMainWindow):
 
     def begin_quit(self) -> None:
         self._quitting = True
+        if self._log_window is not None:
+            self._log_window.close()
+
+    def show_logs(self) -> None:
+        if self._log_window is not None:
+            self._log_window.show_and_raise()
 
     def create_task(
         self, operation: Coroutine[Any, Any, None]
@@ -144,6 +324,7 @@ class SettingsWindow(QMainWindow):
         self._pause_button.setEnabled(not state.busy and enabled)
         self._refresh_button.setEnabled(not state.busy)
         self._sync_privacy_table(state)
+        self._sync_vrchat_state(state)
 
     def _refresh_preview_display(self) -> None:
         if hasattr(self, "_preview"):
@@ -188,12 +369,16 @@ class SettingsWindow(QMainWindow):
                 on_success=lambda: self._code_edit.clear(),
             )
         )
+        log_button = QPushButton("查看运行日志")
+        log_button.setEnabled(self._log_window is not None)
+        log_button.clicked.connect(self.show_logs)
         layout.addStretch()
         layout.addWidget(title)
         layout.addWidget(explanation)
         layout.addWidget(self._pairing_notice)
         layout.addLayout(form)
         layout.addWidget(self._pair_button)
+        layout.addWidget(log_button)
         layout.addStretch(2)
         return page
 
@@ -201,6 +386,9 @@ class SettingsWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._make_overview_tab(), "Live Desk")
         tabs.addTab(self._make_privacy_tab(), "隐私")
+        tabs.addTab(self._make_vrchat_tab(), "VRChat 集成")
+        if self.service.logs is not None:
+            tabs.addTab(LogPanel(self.service.logs, self.service), "日志")
         tabs.addTab(self._make_general_tab(), "常规")
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -267,13 +455,20 @@ class SettingsWindow(QMainWindow):
         grid.addRow(self._source_apps, self._default_apps)
         grid.addRow(self._source_titles, self._default_titles)
         grid.addRow(self._source_media, self._default_media)
-        self._rules = QTableWidget(0, 6)
+        self._rules = QTableWidget(0, 7)
         self._rules.setHorizontalHeaderLabels(
-            ["应用", "标识", "应用", "标题", "媒体", "显示别名"]
+            ["应用", "标识", "应用", "标题", "媒体", "显示别名", "自定义标题"]
         )
         self._rules.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._rules.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self._rules.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        _configure_resizable_header(
+            self._rules,
+            (130, 190, 80, 80, 80, 140, 220),
+        )
+        custom_title_header = self._rules.horizontalHeaderItem(6)
+        if custom_title_header is not None:
+            custom_title_header.setToolTip(
+                "标题分享被允许时，优先使用此固定标题；留空则自动采集"
+            )
         app_rules_page = QWidget()
         app_rules_layout = QVBoxLayout(app_rules_page)
         app_rules_layout.addWidget(QLabel("应用规则（隐藏优先于显示别名）"))
@@ -289,11 +484,9 @@ class SettingsWindow(QMainWindow):
             QAbstractItemView.SelectionBehavior.SelectRows
         )
         self._sensitive_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._sensitive_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
-        )
-        self._sensitive_table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Stretch
+        _configure_resizable_header(
+            self._sensitive_table,
+            (65, 130, 280, 110, 190),
         )
         self._sensitive_table.doubleClicked.connect(lambda _index: self._edit_sensitive_rule())
         sensitive_buttons = QHBoxLayout()
@@ -344,6 +537,99 @@ class SettingsWindow(QMainWindow):
         layout.addWidget(remove)
         return page
 
+    def _make_vrchat_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        explanation = QLabel(
+            "从本机 Discord RPC 命名管道接收 VRChat/VRCX Activity。"
+            "世界名称仍需通过窗口标题开关、应用规则和敏感词规则。"
+        )
+        explanation.setWordWrap(True)
+        self._vr_enabled = QCheckBox("启用 VRChat 集成")
+        self._vr_replace_title = QCheckBox("前台为 VRChat 时用世界名称替换窗口标题")
+        self._vr_upload = QCheckBox("上传净化后的 VRC 状态")
+        self._vr_endpoint = QLineEdit()
+        self._vr_endpoint.setPlaceholderText("https://example.com/api/vrc/activity")
+        self._vr_endpoint.setAccessibleName("VRC API POST 端点")
+        self._vr_api_key = QLineEdit()
+        self._vr_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._vr_api_key.setAccessibleName("VRC API 密匙")
+        self._vr_api_key.setPlaceholderText("未设置")
+        form = QFormLayout()
+        form.addRow("", self._vr_enabled)
+        form.addRow("", self._vr_replace_title)
+        form.addRow("", self._vr_upload)
+        form.addRow("完整 POST 端点", self._vr_endpoint)
+        form.addRow("API 密匙", self._vr_api_key)
+        self._vr_status = QLabel("未启用")
+        self._vr_status.setWordWrap(True)
+        form.addRow("运行状态", self._vr_status)
+        button_row = QHBoxLayout()
+        save = QPushButton("保存 VRChat 设置")
+        save.clicked.connect(lambda: self._run(self._save_vrchat))
+        clear_key = QPushButton("清除已保存密匙")
+        clear_key.clicked.connect(self._confirm_clear_vrchat_key)
+        button_row.addWidget(save)
+        button_row.addWidget(clear_key)
+        button_row.addStretch()
+        warning = QLabel(
+            "密匙仅保存到 Windows 凭据保险箱；留空保存表示保留现有密匙。"
+            "修改设置会关闭正在公开的 Live Desk，并要求重新确认预览。"
+        )
+        warning.setWordWrap(True)
+        layout.addWidget(explanation)
+        layout.addLayout(form)
+        layout.addWidget(warning)
+        layout.addLayout(button_row)
+        layout.addStretch()
+        self._vr_enabled.toggled.connect(self._sync_vrchat_controls)
+        self._vr_upload.toggled.connect(self._sync_vrchat_controls)
+        return page
+
+    def _sync_vrchat_controls(self) -> None:
+        enabled = self._vr_enabled.isChecked()
+        upload = enabled and self._vr_upload.isChecked()
+        self._vr_replace_title.setEnabled(enabled)
+        self._vr_upload.setEnabled(enabled)
+        self._vr_endpoint.setEnabled(upload)
+        self._vr_api_key.setEnabled(upload)
+
+    def _sync_vrchat_state(self, state: ServiceViewState) -> None:
+        settings = state.vrchat_settings
+        if settings != self._vr_loaded_settings:
+            self._vr_loaded_settings = settings
+            self._vr_enabled.setChecked(settings.enabled)
+            self._vr_replace_title.setChecked(settings.replace_world_title)
+            self._vr_upload.setChecked(settings.upload_activity)
+            self._vr_endpoint.setText(settings.endpoint_url)
+            self._vr_api_key.clear()
+        self._vr_api_key.setPlaceholderText(
+            "已保存（留空表示保留）"
+            if state.vrchat_api_key_present
+            else "尚未保存密匙"
+        )
+        self._vr_status.setText(state.vrchat_status)
+        self._sync_vrchat_controls()
+
+    async def _save_vrchat(self) -> None:
+        settings = VRChatIntegrationSettings(
+            enabled=self._vr_enabled.isChecked(),
+            replace_world_title=self._vr_replace_title.isChecked(),
+            upload_activity=self._vr_upload.isChecked(),
+            endpoint_url=self._vr_endpoint.text(),
+        )
+        await self.service.save_vrchat_settings(settings, self._vr_api_key.text())
+        self._vr_api_key.clear()
+
+    def _confirm_clear_vrchat_key(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "清除 VRC API 密匙",
+            "确定从 Windows 凭据保险箱删除 VRC API 密匙吗？",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._run(self.service.clear_vrchat_api_key)
+
     def _load_global_privacy(self) -> None:
         sources = self.service.store.load_sources()
         defaults = self.service.store.load_privacy_defaults()
@@ -381,6 +667,7 @@ class SettingsWindow(QMainWindow):
                 combo = _mode_combo(mode)
                 self._rules.setCellWidget(row, column, combo)
             self._rules.setItem(row, 5, QTableWidgetItem(rule.alias or ""))
+            self._rules.setItem(row, 6, QTableWidgetItem(rule.custom_title or ""))
 
     def _render_sensitive_rules(self, selected_row: int | None = None) -> None:
         self._sensitive_table.setRowCount(0)
@@ -507,6 +794,7 @@ class SettingsWindow(QMainWindow):
                     window_title=_combo_mode(self._rules.cellWidget(row, 3)),
                     media=_combo_mode(self._rules.cellWidget(row, 4)),
                     alias=_table_text(self._rules, row, 5),
+                    custom_title=_table_text(self._rules, row, 6),
                 )
             )
         await self.service.save_privacy(
@@ -581,14 +869,18 @@ class TrayController:
         self.tray.setToolTip("Yohaku Companion")
         menu = QMenu()
         open_action = QAction("打开设置", menu)
+        logs_action = QAction("查看日志", menu)
         self._live_action = QAction("开启 Live Desk", menu)
         self._pause_action = QAction("暂停", menu)
         quit_action = QAction("退出", menu)
         open_action.triggered.connect(window.show_and_raise)
+        logs_action.triggered.connect(window.show_logs)
+        logs_action.setEnabled(window._log_window is not None)
         self._live_action.triggered.connect(self._toggle_live)
         self._pause_action.triggered.connect(self._toggle_pause)
         quit_action.triggered.connect(lambda: asyncio.create_task(on_quit()))
         menu.addAction(open_action)
+        menu.addAction(logs_action)
         menu.addSeparator()
         menu.addAction(self._live_action)
         menu.addAction(self._pause_action)
@@ -640,6 +932,19 @@ class TrayController:
                 QMessageBox.warning(self._window, "操作未完成", str(error))
 
         self._window.create_task(execute())
+
+
+def _configure_resizable_header(
+    table: QTableWidget,
+    widths: tuple[int, ...],
+) -> None:
+    """Keep every divider user-draggable while providing useful initial widths."""
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+    header.setMinimumSectionSize(45)
+    header.setStretchLastSection(False)
+    for column, width in enumerate(widths):
+        table.setColumnWidth(column, width)
 
 
 def _mode_combo(mode: ShareMode) -> QComboBox:

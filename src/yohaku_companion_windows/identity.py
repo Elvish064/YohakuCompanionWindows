@@ -5,7 +5,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-APP_VERSION = "1.7.9"
+APP_VERSION = "1.7.10"
 PRODUCT_NAME = "Yohaku Companion"
 
 

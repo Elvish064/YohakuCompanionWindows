@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 
 from .capture import PresenceCapture
 from .coordinator import LiveDeskCoordinator
-from .credentials import CredentialError, CredentialStore
+from .credentials import CredentialError, CredentialStore, VRChatCredentialStore
 from .domain import (
     ApplicationRule,
     ClearReason,
+    LoggingSettings,
     PrivacyDefaults,
     RuleCandidate,
     RuntimeState,
@@ -16,11 +18,19 @@ from .domain import (
     SensitiveTextRule,
     ServiceViewState,
     SourceSettings,
+    VRChatIntegrationSettings,
 )
+from .http_client import verify_transport_address
+from .logging_service import ProcessLogService
 from .media_capture import MediaProvider
 from .pairing import PairingInstaller
-from .privacy import PreviewConsentGate
+from .privacy import PreviewConsentGate, PrivacyEvaluator
 from .storage import StateStore
+from .vrchat import VRChatIntegration, validate_vrc_endpoint
+
+runtime_log = logging.getLogger("yohaku.运行状态")
+lifecycle_log = logging.getLogger("yohaku.生命周期")
+media_log = logging.getLogger("yohaku.媒体")
 
 
 class ServiceError(RuntimeError):
@@ -36,20 +46,30 @@ class ApplicationService:
         credentials: CredentialStore,
         capture: PresenceCapture,
         media: MediaProvider,
+        vrchat_credentials: VRChatCredentialStore | None = None,
+        vrchat: VRChatIntegration | None = None,
+        logs: ProcessLogService | None = None,
     ) -> None:
         self.store = store
         self.credentials = credentials
         self.capture = capture
         self.media = media
+        self.vrchat_credentials = vrchat_credentials
+        self.vrchat = vrchat
+        self.logs = logs
         self.consent = PreviewConsentGate()
         self.mutation_lock = asyncio.Lock()
         self.state = ServiceViewState(
             connection=store.load_connection(),
             paused=store.is_paused(),
+            vrchat_settings=store.load_vrchat_settings(),
         )
         self._listeners: list[Callable[[ServiceViewState], None]] = []
         self._lifecycle_available = False
         self._session_suspended = False
+        self._shutting_down = False
+        self._vrchat_task: asyncio.Task[None] | None = None
+        self._vrchat_lock = asyncio.Lock()
         capture.set_candidates_callback(self._candidates_changed)
         self.coordinator = LiveDeskCoordinator(
             store,
@@ -70,7 +90,12 @@ class ApplicationService:
         self._notify()
 
     async def initialize(self) -> None:
-        await self.media.start(self.coordinator.request_refresh)
+        runtime_log.info("客户端初始化，版本状态已加载")
+        media_available = await self.media.start(self.coordinator.request_refresh)
+        media_log.info(
+            "系统媒体能力%s",
+            "可用" if media_available else "不可用，已降级为应用 Presence",
+        )
         credential_error = False
         try:
             token = await self.credentials.get_token()
@@ -90,6 +115,15 @@ class ApplicationService:
             self.state.notice = "Windows 凭据后端不可用，无法进行配对"
         self.state.connection = metadata
         self.state.paused = self.store.is_paused()
+        self.state.vrchat_settings = self.store.load_vrchat_settings()
+        if self.vrchat_credentials is not None:
+            try:
+                self.state.vrchat_api_key_present = (
+                    await self.vrchat_credentials.get_api_key() is not None
+                )
+            except CredentialError:
+                self.state.vrchat_api_key_present = False
+                self.state.notice = "Windows 凭据后端不可用，无法读取 VRC API 密匙状态"
         if (
             metadata is not None
             and metadata.live_desk_enabled
@@ -134,6 +168,7 @@ class ApplicationService:
                 self.state.preview_current = False
                 self.state.paused = False
                 self.state.notice = "配对成功。请检查净化预览后再开启 Live Desk。"
+                runtime_log.info("设备配对成功；Live Desk 保持关闭")
             finally:
                 self._set_busy(False)
 
@@ -163,12 +198,14 @@ class ApplicationService:
 
     async def disable_live_desk(self) -> None:
         async with self.mutation_lock:
+            await self._stop_vrchat()
             self.state.connection = self.store.set_live_desk_enabled(False)
             await self.coordinator.stop(ClearReason.PAUSED, RuntimeState.DISABLED)
             self._notify()
 
     async def pause(self) -> None:
         async with self.mutation_lock:
+            await self._stop_vrchat()
             self.store.set_paused(True)
             self.state.paused = True
             await self.coordinator.stop(ClearReason.PAUSED, RuntimeState.SUSPENDED)
@@ -192,15 +229,24 @@ class ApplicationService:
 
     async def remove_device(self) -> None:
         async with self.mutation_lock:
+            await self._stop_vrchat()
             self.state.connection = self.store.set_live_desk_enabled(False)
             await self.coordinator.stop(
                 ClearReason.CONNECTION_REMOVED, RuntimeState.DISABLED
             )
             await self.credentials.delete_token()
+            if self.vrchat_credentials is not None:
+                await self.vrchat_credentials.delete_api_key()
+            disabled_vrchat = VRChatIntegrationSettings()
+            self.store.save_vrchat_settings(disabled_vrchat)
             self.store.remove_connection()
             self.store.set_paused(False)
             self.consent.clear()
-            self.state = ServiceViewState(notice="设备连接已移除")
+            self.state = ServiceViewState(
+                notice="设备连接已移除",
+                vrchat_settings=disabled_vrchat,
+            )
+            runtime_log.info("设备连接及关联凭据已移除")
             self._notify()
 
     async def save_privacy(
@@ -214,6 +260,7 @@ class ApplicationService:
             was_enabled = bool(
                 self.state.connection and self.state.connection.live_desk_enabled
             )
+            await self._stop_vrchat()
             if was_enabled:
                 self.state.connection = self.store.set_live_desk_enabled(False)
                 await self.coordinator.stop(
@@ -233,6 +280,8 @@ class ApplicationService:
 
     async def handle_suspend(self) -> None:
         self._session_suspended = True
+        await self._stop_vrchat()
+        lifecycle_log.info("会话锁定或系统休眠，集成已停止")
         if (
             self.state.connection
             and self.state.connection.live_desk_enabled
@@ -247,12 +296,19 @@ class ApplicationService:
 
     async def shutdown(self) -> None:
         async with self.mutation_lock:
+            self._shutting_down = True
+            await self._stop_vrchat()
             await self.coordinator.shutdown()
             await self.media.stop()
+            runtime_log.info("客户端有序退出")
             self.store.close()
+            if self.logs is not None:
+                self.logs.uninstall()
 
     def _runtime_changed(self, state: RuntimeState) -> None:
         self.state.runtime_state = state
+        runtime_log.info("Live Desk 状态：%s", state.value)
+        self._schedule_vrchat_reconcile()
         self._notify()
 
     def _published_snapshot(self, snapshot: SanitizedPresenceSnapshot) -> None:
@@ -272,3 +328,133 @@ class ApplicationService:
     def _notify(self) -> None:
         for listener in tuple(self._listeners):
             listener(self.state)
+
+    async def save_vrchat_settings(
+        self,
+        settings: VRChatIntegrationSettings,
+        api_key: str = "",
+    ) -> None:
+        async with self.mutation_lock:
+            normalized = VRChatIntegrationSettings.from_dict(settings.to_dict())
+            new_key = api_key.strip()
+            existing_key = (
+                await self.vrchat_credentials.get_api_key()
+                if self.vrchat_credentials is not None
+                else None
+            )
+            if normalized.enabled and normalized.upload_activity:
+                validate_vrc_endpoint(normalized.endpoint_url)
+                await verify_transport_address(normalized.endpoint_url)
+                if not new_key and not existing_key:
+                    raise ServiceError("开启 VRC 状态上传前必须填写 API 密匙")
+            was_enabled = bool(
+                self.state.connection and self.state.connection.live_desk_enabled
+            )
+            await self._stop_vrchat()
+            if was_enabled:
+                self.state.connection = self.store.set_live_desk_enabled(False)
+                await self.coordinator.stop(
+                    ClearReason.PRIVACY_CHANGED, RuntimeState.DISABLED
+                )
+            if new_key:
+                if self.vrchat_credentials is None:
+                    raise ServiceError("VRC API 凭据存储不可用")
+                await self.vrchat_credentials.set_api_key(new_key)
+                existing_key = new_key
+            self.store.save_vrchat_settings(normalized)
+            self.state.vrchat_settings = normalized
+            self.state.vrchat_api_key_present = existing_key is not None
+            self.state.vrchat_status = "等待 Live Desk 公开" if normalized.enabled else "未启用"
+            self.consent.policy_changed()
+            self.state.preview = None
+            self.state.preview_current = False
+            self.state.notice = "VRChat 设置已更新，请重新检查净化预览"
+            runtime_log.info("VRChat 集成设置已保存；敏感内容未写入日志")
+            self._notify()
+
+    async def clear_vrchat_api_key(self) -> None:
+        async with self.mutation_lock:
+            await self._stop_vrchat()
+            if self.state.connection and self.state.connection.live_desk_enabled:
+                self.state.connection = self.store.set_live_desk_enabled(False)
+                await self.coordinator.stop(
+                    ClearReason.PRIVACY_CHANGED, RuntimeState.DISABLED
+                )
+            if self.vrchat_credentials is not None:
+                await self.vrchat_credentials.delete_api_key()
+            self.state.vrchat_api_key_present = False
+            self.state.vrchat_status = "缺少 API 密匙"
+            self.consent.policy_changed()
+            self.state.preview = None
+            self.state.preview_current = False
+            self.state.notice = "VRC API 密匙已清除，请重新检查净化预览"
+            self._notify()
+
+    async def save_logging_settings(self, settings: LoggingSettings) -> None:
+        async with self.mutation_lock:
+            self.store.save_logging_settings(settings)
+            if self.logs is not None:
+                self.logs.set_file_enabled(settings.file_enabled)
+                self.logs.set_vrchat_debug_enabled(settings.vrchat_debug_enabled)
+            runtime_log.info("文件日志已%s", "开启" if settings.file_enabled else "关闭")
+
+    def _schedule_vrchat_reconcile(self) -> None:
+        if self.vrchat is None or self._shutting_down:
+            return
+        if self._vrchat_task is not None and not self._vrchat_task.done():
+            self._vrchat_task.cancel()
+        self._vrchat_task = asyncio.create_task(self._reconcile_vrchat())
+
+    async def _reconcile_vrchat(self) -> None:
+        async with self._vrchat_lock:
+            settings = self.store.load_vrchat_settings()
+            should_run = (
+                settings.enabled
+                and self.state.runtime_state is RuntimeState.ACTIVE
+                and not self.state.paused
+                and not self._session_suspended
+            )
+            if not should_run:
+                await self._stop_vrchat_locked()
+                if settings.enabled:
+                    self.state.vrchat_status = "等待 Live Desk 公开"
+                return
+            if self.vrchat is None or self.vrchat.running:
+                return
+            try:
+                api_key = (
+                    await self.vrchat_credentials.get_api_key()
+                    if self.vrchat_credentials is not None
+                    else None
+                )
+                evaluator = PrivacyEvaluator(
+                    self.store.load_privacy_defaults(),
+                    self.store.load_rules(),
+                    self.store.load_sensitive_rules(),
+                )
+                def request_refresh() -> None:
+                    asyncio.create_task(self.coordinator.request_refresh())
+
+                await self.vrchat.start(
+                    settings,
+                    api_key,
+                    evaluator,
+                    request_refresh,
+                )
+                self.state.vrchat_status = "正在捕获"
+            except Exception as error:
+                self.state.vrchat_status = f"启动失败：{error}"
+                runtime_log.warning("VRChat 集成启动失败：%s", type(error).__name__)
+            self._notify()
+
+    async def _stop_vrchat(self) -> None:
+        task, self._vrchat_task = self._vrchat_task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        async with self._vrchat_lock:
+            await self._stop_vrchat_locked()
+
+    async def _stop_vrchat_locked(self) -> None:
+        if self.vrchat is not None:
+            await self.vrchat.stop()
