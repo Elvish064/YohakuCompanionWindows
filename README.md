@@ -100,7 +100,7 @@ https://example.com/api/v3/companion/capabilities
 局域网 HTTP 示例：
 
 ```text
-http://192.168.3.36:2333/api/v3
+http://192.168.1.114:2333/api/v3
 ```
 
 HTTP 仅允许主机解析到私有、回环或链路本地 IP；公网服务器必须使用 HTTPS。局域网 HTTP 会绕过环境代理直接连接，避免配对码或设备令牌被转发给代理，但 HTTP 本身没有传输加密，同一网络中的攻击者仍可能窃听数据。条件允许时应优先部署 HTTPS。
@@ -108,7 +108,7 @@ HTTP 仅允许主机解析到私有、回环或链路本地 IP；公网服务器
 可以先在 PowerShell 验证能力接口：
 
 ```powershell
-curl.exe -i http://192.168.3.36:2333/api/v3/companion/capabilities
+curl.exe -i http://192.168.1.114:2333/api/v3/companion/capabilities
 ```
 
 预期返回 HTTP 200、`liveDesk: true`，并包含 Presence schema v2。
@@ -211,11 +211,13 @@ curl.exe -i http://192.168.3.36:2333/api/v3/companion/capabilities
 
 捕获器监听本机 `discord-ipc-0..9`，只接受 `SET_ACTIVITY` 中 PID 可验证为 `vrchat.exe` 或 `vrcx.exe` 的消息。世界名称不会绕过隐私设置：必须同时允许窗口标题来源和 VRChat 应用标题规则，并继续经过长度限制及敏感词规则。没有有效世界名称时回退到普通窗口标题。
 
+使用前需先在VRCX中**关闭VRChat的原生discord状态面板，并开启VRCX的discord状态面板**。将自动捕捉符合条件的discord状态。
+
 VRC 上传端点示例：
 
 ```text
-https://example.com/api/vrc/activity
-http://192.168.3.36:2333/api/vrc/activity
+https://example.com/api/v3/fn/ps/vrc
+http://192.168.1.114:2333/api/v3/fn/ps/vrc
 ```
 
 端点是完整 POST URL。公网必须使用 HTTPS；HTTP 只允许私有、回环或链路本地地址，并会在每次请求前重新验证 DNS、绕过环境代理。请求使用 `X-API-Key`，正文只包含 `capture_at`、`nonce` 和净化后的 `activity`。Activity 白名单仅保留 `details`、`state`、合法 `timestamps` 及 `assets.large_image`/`assets.small_image`；party、secrets、buttons 和未知字段不会上传。
@@ -431,4 +433,3 @@ cd YohakuCompanionWindows
 
 ## 目前已知问题
 - [ ] foobar2000 播放器 无法正确获取歌曲时长
-- [ ] 图形化正则式编辑分割多个词语应为`|`而非`,`
