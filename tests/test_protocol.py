@@ -86,6 +86,59 @@ def test_idle_has_explicit_application_and_media_null() -> None:
     assert value["data"]["media"] is None
 
 
+def test_extended_application_and_media_assets_are_serialized() -> None:
+    digest = "a" * 64
+    playback = SanitizedMediaPlayback(
+        PlaybackState.PAUSED, 60, 10, now(), 0
+    )
+    media = SanitizedMediaPresence(
+        UUID("123e4567-e89b-12d3-a456-426614174099"),
+        MediaKind.MUSIC,
+        "Song",
+        "Artist",
+        "Album",
+        "Player",
+        playback,
+        f"https://cdn.example.com/cover.webp?v={digest}",
+        "https://music.163.com/song?id=123",
+    )
+    app = SanitizedApplicationPresence(
+        "Editor",
+        "Project",
+        "https://cdn.example.com/icons/editor.webp",
+        "coding",
+        "正在开发",
+    )
+    value = make_presence_request(
+        SanitizedPresenceSnapshot(now(), app, media),
+        DEVICE_ID,
+        1,
+        configuration(),
+        request_id=REQUEST_ID,
+    )
+    assert value["data"]["application"]["icon"]["url"].endswith("editor.webp")
+    assert value["data"]["application"]["activity"] == {
+        "key": "coding",
+        "customLabel": "正在开发",
+    }
+    assert value["data"]["media"]["artwork"]["url"].endswith(digest)
+    assert value["data"]["media"]["link"]["url"].endswith("id=123")
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"icon_url": "http://example.com/icon.webp"},
+        {"activity_key": "Invalid Key"},
+    ],
+)
+def test_extended_application_validation_is_fail_closed(
+    kwargs: dict[str, str],
+) -> None:
+    with pytest.raises(ValueError):
+        SanitizedApplicationPresence("Editor", **kwargs)
+
+
 def test_wire_timestamp_is_rfc3339_milliseconds() -> None:
     assert wire_timestamp(now()) == "2026-07-18T01:02:03.456Z"
     assert wire_timestamp(datetime(2026, 1, 1, tzinfo=UTC)).endswith(".000Z")

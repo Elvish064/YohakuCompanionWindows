@@ -48,7 +48,11 @@ class PresenceWriter:
         self._client = client
         self._send_lock = asyncio.Lock()
 
-    async def replace(self, snapshot: SanitizedPresenceSnapshot) -> MutationResult:
+    async def replace(
+        self,
+        snapshot: SanitizedPresenceSnapshot,
+        requested_lease_seconds: int = 90,
+    ) -> MutationResult:
         async with self._send_lock:
             sequence = self._store.reserve_sequence(
                 self._metadata.device_id, self._metadata.pairing_next_sequence
@@ -60,6 +64,7 @@ class PresenceWriter:
                 self._metadata.device_id,
                 sequence,
                 self._configuration,
+                requested_lease_seconds=requested_lease_seconds,
                 request_id=request_id,
             )
             return await self._send_exact(

@@ -16,6 +16,8 @@ from yohaku_companion_windows.domain import (
     SanitizedApplicationPresence,
     SanitizedPresenceSnapshot,
 )
+from yohaku_companion_windows.http_client import ResponseFailure
+from yohaku_companion_windows.protocol import APIError
 
 
 class Store:
@@ -76,6 +78,41 @@ class Writer:
         del reason, observed_at
 
 
+class IconCapture(Capture):
+    async def capture(self, include_media: bool = True) -> SanitizedPresenceSnapshot:
+        del include_media
+        return SanitizedPresenceSnapshot(
+            datetime.now(UTC),
+            SanitizedApplicationPresence(
+                "Icon App",
+                icon_url="https://blocked.example/icon.webp",
+            ),
+            None,
+        )
+
+
+class IconRejectingWriter:
+    def __init__(self) -> None:
+        self.snapshots: list[SanitizedPresenceSnapshot] = []
+        self.fallback_sent = asyncio.Event()
+
+    async def replace(self, snapshot: SanitizedPresenceSnapshot) -> None:
+        self.snapshots.append(snapshot)
+        if len(self.snapshots) == 1:
+            raise ResponseFailure(
+                APIError(
+                    422,
+                    "COMPANION_ICON_HOST_NOT_ALLOWED",
+                    False,
+                    None,
+                )
+            )
+        self.fallback_sent.set()
+
+    async def clear(self, reason: ClearReason, observed_at: datetime) -> None:
+        del reason, observed_at
+
+
 @pytest.mark.asyncio
 async def test_refresh_events_coalesce_while_send_is_in_flight(
     monkeypatch,  # type: ignore[no-untyped-def]
@@ -117,4 +154,48 @@ async def test_refresh_events_coalesce_while_send_is_in_flight(
     assert len(writer.snapshots) == 2
     assert published == writer.snapshots
     assert RuntimeState.ACTIVE in states
+    await coordinator.stop(ClearReason.PAUSED, RuntimeState.DISABLED)
+
+
+@pytest.mark.asyncio
+async def test_disallowed_icon_host_falls_back_without_degrading(
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    configuration = PresenceConfiguration(32768, 60_000, 30, 120, 60, 60, True)
+    client = Client()
+    writer = IconRejectingWriter()
+    monkeypatch.setattr(
+        coordinator_module, "CompanionHTTPClient", lambda server: client
+    )
+    monkeypatch.setattr(
+        coordinator_module,
+        "negotiate_presence",
+        lambda capabilities, version: configuration,
+    )
+    monkeypatch.setattr(
+        coordinator_module, "validate_clock_skew", lambda server_time, maximum: None
+    )
+    monkeypatch.setattr(
+        coordinator_module,
+        "PresenceWriter",
+        lambda metadata, token, config, store, http_client: writer,
+    )
+    states: list[RuntimeState] = []
+    published: list[SanitizedPresenceSnapshot] = []
+    coordinator = LiveDeskCoordinator(
+        Store(),
+        Credentials(),
+        IconCapture(),
+        states.append,
+        published.append,  # type: ignore[arg-type]
+    )
+    await coordinator.start()
+    await asyncio.wait_for(writer.fallback_sent.wait(), 1)
+    assert writer.snapshots[0].application is not None
+    assert writer.snapshots[0].application.icon_url is not None
+    assert writer.snapshots[1].application is not None
+    assert writer.snapshots[1].application.icon_url is None
+    assert published[-1].application is not None
+    assert published[-1].application.icon_url is None
+    assert states[-1] is RuntimeState.ACTIVE
     await coordinator.stop(ClearReason.PAUSED, RuntimeState.DISABLED)

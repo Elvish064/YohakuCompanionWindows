@@ -9,6 +9,7 @@ from typing import Any
 import regex
 
 from .domain import (
+    ApplicationIconTemplateSettings,
     ApplicationRule,
     ConnectionMetadata,
     LoggingSettings,
@@ -58,7 +59,11 @@ class StateStore:
                     window_title TEXT NOT NULL,
                     media TEXT NOT NULL,
                     alias TEXT,
-                    custom_title TEXT
+                    custom_title TEXT,
+                    icon_filename TEXT,
+                    activity_key TEXT,
+                    activity_custom_label TEXT,
+                    media_artwork_url TEXT
                 );
                 CREATE TABLE IF NOT EXISTS presence_sequences (
                     device_id TEXT PRIMARY KEY NOT NULL,
@@ -98,6 +103,16 @@ class StateStore:
                 self._connection.execute(
                     "ALTER TABLE privacy_rules ADD COLUMN custom_title TEXT"
                 )
+            for name in (
+                "icon_filename",
+                "activity_key",
+                "activity_custom_label",
+                "media_artwork_url",
+            ):
+                if name not in privacy_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE privacy_rules ADD COLUMN {name} TEXT"
+                    )
             self._connection.commit()
 
     def close(self) -> None:
@@ -217,7 +232,8 @@ class StateStore:
             rows = self._connection.execute(
                 """
                 SELECT identifier, display_name, application, window_title,
-                       media, alias, custom_title
+                       media, alias, custom_title, icon_filename, activity_key,
+                       activity_custom_label, media_artwork_url
                 FROM privacy_rules ORDER BY display_name COLLATE NOCASE, identifier
                 """
             ).fetchall()
@@ -235,6 +251,24 @@ class StateStore:
                         if row["custom_title"] is None
                         else str(row["custom_title"])
                     ),
+                    icon_filename=(
+                        None
+                        if row["icon_filename"] is None
+                        else str(row["icon_filename"])
+                    ),
+                    activity_key=(
+                        None
+                        if row["activity_key"] is None
+                        else str(row["activity_key"])
+                    ),
+                    activity_custom_label=(
+                        None if row["activity_custom_label"] is None
+                        else str(row["activity_custom_label"])
+                    ),
+                    media_artwork_url=(
+                        None if row["media_artwork_url"] is None
+                        else str(row["media_artwork_url"])
+                    ),
                 ).normalized()
                 for row in rows
             )
@@ -250,15 +284,20 @@ class StateStore:
                 """
                 INSERT INTO privacy_rules(
                     identifier, display_name, application, window_title,
-                    media, alias, custom_title
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    media, alias, custom_title, icon_filename, activity_key,
+                    activity_custom_label, media_artwork_url
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(identifier) DO UPDATE SET
                     display_name = excluded.display_name,
                     application = excluded.application,
                     window_title = excluded.window_title,
                     media = excluded.media,
                     alias = excluded.alias,
-                    custom_title = excluded.custom_title
+                    custom_title = excluded.custom_title,
+                    icon_filename = excluded.icon_filename,
+                    activity_key = excluded.activity_key,
+                    activity_custom_label = excluded.activity_custom_label,
+                    media_artwork_url = excluded.media_artwork_url
                 """,
                 (
                     normalized.identifier,
@@ -268,6 +307,10 @@ class StateStore:
                     normalized.media.value,
                     normalized.alias,
                     normalized.custom_title,
+                    normalized.icon_filename,
+                    normalized.activity_key,
+                    normalized.activity_custom_label,
+                    normalized.media_artwork_url,
                 ),
             )
 
@@ -281,8 +324,9 @@ class StateStore:
                 """
                 INSERT INTO privacy_rules(
                     identifier, display_name, application, window_title,
-                    media, alias, custom_title
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    media, alias, custom_title, icon_filename, activity_key,
+                    activity_custom_label, media_artwork_url
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -293,6 +337,10 @@ class StateStore:
                         rule.media.value,
                         rule.alias,
                         rule.custom_title,
+                        rule.icon_filename,
+                        rule.activity_key,
+                        rule.activity_custom_label,
+                        rule.media_artwork_url,
                     )
                     for rule in normalized
                 ],
@@ -370,6 +418,7 @@ class StateStore:
         defaults: PrivacyDefaults,
         rules: tuple[ApplicationRule, ...],
         sensitive_rules: tuple[SensitiveTextRule, ...],
+        icon_template: ApplicationIconTemplateSettings | None = None,
     ) -> None:
         normalized = tuple(rule.normalized() for rule in rules)
         if len({rule.identifier for rule in normalized}) != len(normalized):
@@ -379,6 +428,10 @@ class StateStore:
             for key, value in (
                 ("sources.v1", _json(sources.to_dict())),
                 ("privacy.defaults.v1", _json(defaults.to_dict())),
+                (
+                    "application.icon-template.v1",
+                    _json((icon_template or self.load_icon_template()).to_dict()),
+                ),
             ):
                 self._connection.execute(
                     """
@@ -392,8 +445,9 @@ class StateStore:
                 """
                 INSERT INTO privacy_rules(
                     identifier, display_name, application, window_title,
-                    media, alias, custom_title
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    media, alias, custom_title, icon_filename, activity_key,
+                    activity_custom_label, media_artwork_url
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -404,11 +458,33 @@ class StateStore:
                         rule.media.value,
                         rule.alias,
                         rule.custom_title,
+                        rule.icon_filename,
+                        rule.activity_key,
+                        rule.activity_custom_label,
+                        rule.media_artwork_url,
                     )
                     for rule in normalized
                 ],
             )
             self._replace_sensitive_rules_in_transaction(normalized_sensitive)
+
+    def load_icon_template(self) -> ApplicationIconTemplateSettings:
+        raw = self._read_metadata("application.icon-template.v1")
+        if raw is None:
+            return ApplicationIconTemplateSettings()
+        try:
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise ValueError
+            return ApplicationIconTemplateSettings.from_dict(value)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise StorageError("invalid application icon template") from error
+
+    def save_icon_template(self, settings: ApplicationIconTemplateSettings) -> None:
+        self._write_metadata(
+            "application.icon-template.v1",
+            _json(settings.to_dict()),
+        )
 
     def _replace_sensitive_rules_in_transaction(
         self,

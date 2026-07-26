@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yohaku-companion-windows"
-version = "1.7.10"
+version = "1.7.12"
 description = "Privacy-first Yohaku Live Desk companion for Windows"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

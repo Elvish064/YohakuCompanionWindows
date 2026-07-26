@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -155,11 +156,13 @@ class VRChatIntegrationSettings:
 class LoggingSettings:
     file_enabled: bool = False
     vrchat_debug_enabled: bool = False
+    master_enabled: bool = True
 
     def to_dict(self) -> dict[str, bool]:
         return {
             "fileEnabled": self.file_enabled,
             "vrchatDebugEnabled": self.vrchat_debug_enabled,
+            "masterEnabled": self.master_enabled,
         }
 
     @classmethod
@@ -169,7 +172,61 @@ class LoggingSettings:
             vrchat_debug_enabled=_stored_bool(
                 value, "vrchatDebugEnabled", False
             ),
+            master_enabled=_stored_bool(value, "masterEnabled", True),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ApplicationIconTemplateSettings:
+    enabled: bool = False
+    prefix: str = ""
+    suffix: str = ".webp"
+
+    def to_dict(self) -> dict[str, bool | str]:
+        return {
+            "enabled": self.enabled,
+            "prefix": self.prefix.strip(),
+            "suffix": self.suffix.strip() or ".webp",
+        }
+
+    def normalized(self) -> ApplicationIconTemplateSettings:
+        from urllib.parse import urlsplit
+
+        prefix = self.prefix.strip()
+        suffix = self.suffix.strip() or ".webp"
+        if self.enabled:
+            parsed = urlsplit(prefix)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError("invalid icon URL prefix")
+            if (
+                not suffix.startswith(".")
+                or any(character in suffix for character in "/\\?#%")
+                or len(suffix) > 32
+            ):
+                raise ValueError("invalid icon URL suffix")
+            normalize_https_url(f"{prefix}example{suffix}")
+        return ApplicationIconTemplateSettings(self.enabled, prefix, suffix)
+
+    @classmethod
+    def from_dict(
+        cls, value: dict[str, Any]
+    ) -> ApplicationIconTemplateSettings:
+        prefix = value.get("prefix", "")
+        suffix = value.get("suffix", ".webp")
+        if not isinstance(prefix, str) or not isinstance(suffix, str):
+            raise ValueError("invalid application icon template")
+        return cls(
+            enabled=_stored_bool(value, "enabled", False),
+            prefix=prefix.strip(),
+            suffix=suffix.strip() or ".webp",
+        ).normalized()
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +260,10 @@ class ApplicationRule:
     media: ShareMode = ShareMode.INHERIT
     alias: str | None = None
     custom_title: str | None = None
+    icon_filename: str | None = None
+    activity_key: str | None = None
+    activity_custom_label: str | None = None
+    media_artwork_url: str | None = None
 
     def normalized(self) -> ApplicationRule:
         identifier = unicodedata.normalize("NFC", self.identifier.strip()).casefold()
@@ -215,6 +276,10 @@ class ApplicationRule:
             media=self.media,
             alias=normalize_text(self.alias, 120),
             custom_title=normalize_text(self.custom_title, 500),
+            icon_filename=normalize_icon_filename(self.icon_filename),
+            activity_key=normalize_activity_key(self.activity_key),
+            activity_custom_label=normalize_text(self.activity_custom_label, 80),
+            media_artwork_url=normalize_artwork_url(self.media_artwork_url),
         )
 
 
@@ -352,6 +417,9 @@ class RawMediaPresence:
 class SanitizedApplicationPresence:
     display_name: str
     window_title: str | None = None
+    icon_url: str | None = None
+    activity_key: str | None = None
+    activity_custom_label: str | None = None
 
     def __post_init__(self) -> None:
         display_name = normalize_text(self.display_name, 120)
@@ -359,6 +427,13 @@ class SanitizedApplicationPresence:
             raise ValueError("application display name is required")
         object.__setattr__(self, "display_name", display_name)
         object.__setattr__(self, "window_title", normalize_text(self.window_title, 500))
+        object.__setattr__(self, "icon_url", normalize_https_url(self.icon_url))
+        object.__setattr__(self, "activity_key", normalize_activity_key(self.activity_key))
+        object.__setattr__(
+            self,
+            "activity_custom_label",
+            normalize_text(self.activity_custom_label, 80),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,15 +465,25 @@ class SanitizedMediaPlayback:
 
 @dataclass(frozen=True, slots=True)
 class SanitizedMediaPresence:
-    session_id: UUID
+    session_id: UUID | str
     kind: MediaKind
     title: str | None
     artist: str | None
     album: str | None
     player_display_name: str | None
     playback: SanitizedMediaPlayback
+    artwork_url: str | None = None
+    link_url: str | None = None
 
     def __post_init__(self) -> None:
+        session = str(self.session_id)
+        try:
+            UUID(session)
+        except ValueError:
+            if re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", session.upper()) is None:
+                raise ValueError("invalid media session identifier") from None
+            session = session.upper()
+        object.__setattr__(self, "session_id", session)
         title = normalize_text(self.title, 300)
         artist = normalize_text(self.artist, 300)
         if title is None and artist is None:
@@ -411,6 +496,8 @@ class SanitizedMediaPresence:
             "player_display_name",
             normalize_text(self.player_display_name, 120),
         )
+        object.__setattr__(self, "artwork_url", normalize_artwork_url(self.artwork_url))
+        object.__setattr__(self, "link_url", normalize_media_link(self.link_url))
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,6 +540,17 @@ class SanitizedPresenceSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class CustomBroadcastSpec:
+    snapshot: SanitizedPresenceSnapshot
+    duration_seconds: int = 60
+    apply_sensitive_rules: bool = True
+
+    def __post_init__(self) -> None:
+        if not 5 <= self.duration_seconds <= 86_400:
+            raise ValueError("test broadcast duration must be 5 to 86400 seconds")
+
+
+@dataclass(frozen=True, slots=True)
 class PresenceConfiguration:
     maximum_payload_bytes: int
     requests_per_minute: int
@@ -486,6 +584,96 @@ class ServiceViewState:
     )
     vrchat_api_key_present: bool = False
     vrchat_status: str = "未启用"
+    test_broadcast_active: bool = False
+    test_broadcast_status: str = "未运行"
+
+
+_ACTIVITY_KEY = re.compile(r"^[a-z][\d.a-z-]{0,63}$")
+_ICON_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def normalize_activity_key(value: str | None) -> str | None:
+    normalized = normalize_text(value, 64)
+    if normalized is not None and _ACTIVITY_KEY.fullmatch(normalized) is None:
+        raise ValueError("invalid activity key")
+    return normalized
+
+
+def normalize_icon_filename(value: str | None) -> str | None:
+    normalized = normalize_text(value, 128)
+    if normalized is None:
+        return None
+    if (
+        _ICON_FILENAME.fullmatch(normalized) is None
+        or ".." in normalized
+        or "%" in normalized
+    ):
+        raise ValueError("invalid icon filename")
+    return normalized
+
+
+def normalize_https_url(value: str | None) -> str | None:
+    from urllib.parse import urlsplit
+
+    normalized = normalize_text(value)
+    if normalized is None:
+        return None
+    parsed = urlsplit(normalized)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or len(normalized.encode("utf-8")) > 2048
+    ):
+        raise ValueError("invalid HTTPS URL")
+    return normalized
+
+
+def normalize_artwork_url(value: str | None) -> str | None:
+    from urllib.parse import parse_qsl, urlsplit
+
+    normalized = normalize_https_url(value)
+    if normalized is None:
+        return None
+    parsed = urlsplit(normalized)
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    if (
+        parsed.fragment
+        or len(query) != 1
+        or query[0][0] != "v"
+        or not _SHA256.fullmatch(query[0][1])
+    ):
+        raise ValueError("invalid media artwork URL")
+    return normalized
+
+
+def normalize_media_link(value: str | None) -> str | None:
+    from urllib.parse import parse_qs, urlsplit
+
+    normalized = normalize_https_url(value)
+    if normalized is None:
+        return None
+    parsed = urlsplit(normalized)
+    qq = (
+        parsed.hostname == "y.qq.com"
+        and parsed.query == ""
+        and parsed.fragment == ""
+        and re.fullmatch(r"/n/ryqq/songDetail/[A-Za-z0-9]+", parsed.path)
+    )
+    query = parse_qs(parsed.query)
+    netease = (
+        parsed.hostname == "music.163.com"
+        and parsed.path == "/song"
+        and parsed.fragment == ""
+        and set(query) == {"id"}
+        and len(query["id"]) == 1
+        and query["id"][0].isdigit()
+    )
+    if not (qq or netease):
+        raise ValueError("unsupported media link")
+    return normalized
 
 
 def _stored_bool(value: dict[str, Any], key: str, fallback: bool) -> bool:

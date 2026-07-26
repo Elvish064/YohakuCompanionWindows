@@ -9,6 +9,8 @@ import pytest
 
 from tests.helpers import DEVICE_ID, mutation_payload
 from yohaku_companion_windows.domain import (
+    ApplicationIconTemplateSettings,
+    ApplicationRule,
     ConnectionMetadata,
     PresenceConfiguration,
     SanitizedPresenceSnapshot,
@@ -99,6 +101,31 @@ def test_sequence_is_persisted_before_send_and_never_reused(tmp_path: Path) -> N
     reopened.reconcile_sequence(DEVICE_ID, 80)
     assert reopened.reserve_sequence(DEVICE_ID, 50) == 81
     reopened.close()
+
+
+def test_extended_rule_and_icon_template_persist(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite3")
+    rule = ApplicationRule(
+        "win32:code.exe",
+        "Code",
+        icon_filename="vscode",
+        activity_key="coding",
+        activity_custom_label="开发中",
+        media_artwork_url=(
+            "https://cdn.example.com/cover.webp?v=" + "b" * 64
+        ),
+    )
+    store.save_rule(rule)
+    store.save_icon_template(
+        ApplicationIconTemplateSettings(
+            True,
+            "https://cdn.example.com/icons/",
+            ".webp",
+        )
+    )
+    assert store.load_rules() == (rule.normalized(),)
+    assert store.load_icon_template().enabled
+    store.close()
 
 
 @pytest.mark.asyncio

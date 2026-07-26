@@ -76,7 +76,7 @@ async def test_pairing_preflight_order_code_location_and_default_disabled(tmp_pa
     assert "one-time-code" not in claim[1]
     assert all("one-time-code" not in value for value in claim[2].values())
     assert all(
-        request[2]["User-Agent"] == "YohakuCompanion/1.7.10 (Windows)"
+        request[2]["User-Agent"] == "YohakuCompanion/1.7.12 (Windows)"
         for request in transport.requests
     )
     assert json.loads(claim[3] or b"{}")["pairingCode"] == "one-time-code"

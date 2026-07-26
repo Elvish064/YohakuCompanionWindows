@@ -7,9 +7,12 @@ from collections.abc import Callable
 from .capture import PresenceCapture
 from .coordinator import LiveDeskCoordinator
 from .credentials import CredentialError, CredentialStore, VRChatCredentialStore
+from .custom_broadcast import CustomBroadcastController
 from .domain import (
+    ApplicationIconTemplateSettings,
     ApplicationRule,
     ClearReason,
+    CustomBroadcastSpec,
     LoggingSettings,
     PrivacyDefaults,
     RuleCandidate,
@@ -58,6 +61,7 @@ class ApplicationService:
         self.vrchat = vrchat
         self.logs = logs
         self.consent = PreviewConsentGate()
+        self.custom_broadcast = CustomBroadcastController(store, credentials)
         self.mutation_lock = asyncio.Lock()
         self.state = ServiceViewState(
             connection=store.load_connection(),
@@ -152,6 +156,7 @@ class ApplicationService:
         self, base_url: str, pairing_code: str, device_name: str
     ) -> None:
         async with self.mutation_lock:
+            await self.custom_broadcast.stop(ClearReason.CONNECTION_REMOVED)
             self._set_busy(True)
             try:
                 if self.store.load_connection() is not None:
@@ -174,6 +179,8 @@ class ApplicationService:
 
     async def enable_live_desk(self) -> None:
         async with self.mutation_lock:
+            if self.custom_broadcast.running:
+                raise ServiceError("测试广播运行期间不能开启 Live Desk")
             metadata = self.store.load_connection()
             if metadata is None or await self.credentials.get_token() is None:
                 raise ServiceError("设备未完成配对")
@@ -198,6 +205,7 @@ class ApplicationService:
 
     async def disable_live_desk(self) -> None:
         async with self.mutation_lock:
+            await self.custom_broadcast.stop()
             await self._stop_vrchat()
             self.state.connection = self.store.set_live_desk_enabled(False)
             await self.coordinator.stop(ClearReason.PAUSED, RuntimeState.DISABLED)
@@ -205,6 +213,7 @@ class ApplicationService:
 
     async def pause(self) -> None:
         async with self.mutation_lock:
+            await self.custom_broadcast.stop()
             await self._stop_vrchat()
             self.store.set_paused(True)
             self.state.paused = True
@@ -229,6 +238,7 @@ class ApplicationService:
 
     async def remove_device(self) -> None:
         async with self.mutation_lock:
+            await self.custom_broadcast.stop(ClearReason.CONNECTION_REMOVED)
             await self._stop_vrchat()
             self.state.connection = self.store.set_live_desk_enabled(False)
             await self.coordinator.stop(
@@ -255,8 +265,13 @@ class ApplicationService:
         defaults: PrivacyDefaults,
         rules: tuple[ApplicationRule, ...],
         sensitive_rules: tuple[SensitiveTextRule, ...] = (),
+        icon_template: ApplicationIconTemplateSettings | None = None,
     ) -> None:
         async with self.mutation_lock:
+            await self.custom_broadcast.stop(ClearReason.PRIVACY_CHANGED)
+            normalized_icon_template = (
+                icon_template or self.store.load_icon_template()
+            ).normalized()
             was_enabled = bool(
                 self.state.connection and self.state.connection.live_desk_enabled
             )
@@ -271,6 +286,7 @@ class ApplicationService:
                 defaults,
                 rules,
                 sensitive_rules,
+                normalized_icon_template,
             )
             self.consent.policy_changed()
             self.state.preview = None
@@ -280,6 +296,7 @@ class ApplicationService:
 
     async def handle_suspend(self) -> None:
         self._session_suspended = True
+        await self.custom_broadcast.stop(ClearReason.SLEEP)
         await self._stop_vrchat()
         lifecycle_log.info("会话锁定或系统休眠，集成已停止")
         if (
@@ -297,6 +314,7 @@ class ApplicationService:
     async def shutdown(self) -> None:
         async with self.mutation_lock:
             self._shutting_down = True
+            await self.custom_broadcast.stop(ClearReason.SHUTDOWN)
             await self._stop_vrchat()
             await self.coordinator.shutdown()
             await self.media.stop()
@@ -335,6 +353,7 @@ class ApplicationService:
         api_key: str = "",
     ) -> None:
         async with self.mutation_lock:
+            await self.custom_broadcast.stop(ClearReason.PRIVACY_CHANGED)
             normalized = VRChatIntegrationSettings.from_dict(settings.to_dict())
             new_key = api_key.strip()
             existing_key = (
@@ -374,6 +393,7 @@ class ApplicationService:
 
     async def clear_vrchat_api_key(self) -> None:
         async with self.mutation_lock:
+            await self.custom_broadcast.stop(ClearReason.PRIVACY_CHANGED)
             await self._stop_vrchat()
             if self.state.connection and self.state.connection.live_desk_enabled:
                 self.state.connection = self.store.set_live_desk_enabled(False)
@@ -394,9 +414,69 @@ class ApplicationService:
         async with self.mutation_lock:
             self.store.save_logging_settings(settings)
             if self.logs is not None:
-                self.logs.set_file_enabled(settings.file_enabled)
-                self.logs.set_vrchat_debug_enabled(settings.vrchat_debug_enabled)
+                self.logs.set_master_enabled(settings.master_enabled)
+                self.logs.set_file_enabled(
+                    settings.master_enabled and settings.file_enabled
+                )
+                self.logs.set_vrchat_debug_enabled(
+                    settings.master_enabled and settings.vrchat_debug_enabled
+                )
             runtime_log.info("文件日志已%s", "开启" if settings.file_enabled else "关闭")
+
+    def prepare_custom_snapshot(
+        self,
+        snapshot: SanitizedPresenceSnapshot,
+        apply_sensitive_rules: bool,
+    ) -> SanitizedPresenceSnapshot:
+        if not apply_sensitive_rules:
+            return snapshot
+        evaluator = PrivacyEvaluator(
+            self.store.load_privacy_defaults(),
+            self.store.load_rules(),
+            self.store.load_sensitive_rules(),
+            self.store.load_icon_template(),
+        )
+        return SanitizedPresenceSnapshot(
+            snapshot.observed_at,
+            evaluator.filter_application(snapshot.application),
+            evaluator.filter_media(snapshot.media),
+        )
+
+    async def start_custom_broadcast(self, spec: CustomBroadcastSpec) -> None:
+        async with self.mutation_lock:
+            if not self._lifecycle_available or self._session_suspended:
+                raise ServiceError("锁屏监听不可用或当前会话已锁定")
+            await self._stop_vrchat()
+            if self.state.connection and self.state.connection.live_desk_enabled:
+                self.state.connection = self.store.set_live_desk_enabled(False)
+                await self.coordinator.stop(
+                    ClearReason.PRIVACY_CHANGED,
+                    RuntimeState.DISABLED,
+                )
+            snapshot = self.prepare_custom_snapshot(
+                spec.snapshot,
+                spec.apply_sensitive_rules,
+            )
+            self.consent.clear()
+            self.state.preview_current = False
+            await self.custom_broadcast.start(
+                CustomBroadcastSpec(
+                    snapshot,
+                    spec.duration_seconds,
+                    spec.apply_sensitive_rules,
+                )
+            )
+            self.state.test_broadcast_active = True
+            self.state.test_broadcast_status = "正在广播"
+            self.state.notice = "测试广播运行中；结束后需重新预览才能开启 Live Desk"
+            self._notify()
+
+    async def stop_custom_broadcast(self) -> None:
+        async with self.mutation_lock:
+            await self.custom_broadcast.stop()
+            self.state.test_broadcast_active = False
+            self.state.test_broadcast_status = self.custom_broadcast.status
+            self._notify()
 
     def _schedule_vrchat_reconcile(self) -> None:
         if self.vrchat is None or self._shutting_down:

@@ -41,6 +41,7 @@ class ProcessLogService(logging.Handler):
         self._entries: deque[LogEntry] = deque(maxlen=maximum_entries)
         self._lock = threading.RLock()
         self._sequence = 0
+        self._master_enabled = True
         self._file_handler: TimedRotatingFileHandler | None = None
         self.setFormatter(
             logging.Formatter(
@@ -65,6 +66,9 @@ class ProcessLogService(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            with self._lock:
+                if not self._master_enabled:
+                    return
             message = redact_message(record.getMessage())
             category = record.name.removeprefix("yohaku.") or "运行状态"
             occurred_at = datetime.fromtimestamp(record.created).astimezone()
@@ -90,11 +94,27 @@ class ProcessLogService(logging.Handler):
 
     def entries(self, after_sequence: int = 0) -> tuple[LogEntry, ...]:
         with self._lock:
+            if not self._master_enabled:
+                return ()
             return tuple(item for item in self._entries if item.sequence > after_sequence)
 
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
+
+    @property
+    def master_enabled(self) -> bool:
+        with self._lock:
+            return self._master_enabled
+
+    def set_master_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            self._master_enabled = enabled
+            if not enabled:
+                self._entries.clear()
+                if self._file_handler is not None:
+                    self._file_handler.close()
+                    self._file_handler = None
 
     @property
     def file_enabled(self) -> bool:
@@ -103,6 +123,7 @@ class ProcessLogService(logging.Handler):
 
     def set_file_enabled(self, enabled: bool) -> None:
         with self._lock:
+            enabled = enabled and self._master_enabled
             if enabled and self._file_handler is None:
                 self.log_directory.mkdir(parents=True, exist_ok=True)
                 handler = TimedRotatingFileHandler(

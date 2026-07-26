@@ -5,12 +5,13 @@ import logging
 import time
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from .capture import PresenceCapture
 from .credentials import CredentialStore
 from .domain import ClearReason, RuntimeState, SanitizedPresenceSnapshot
-from .http_client import CompanionHTTPClient
+from .http_client import CompanionHTTPClient, ResponseFailure
 from .identity import APP_VERSION
 from .protocol import (
     NegotiationError,
@@ -169,11 +170,14 @@ class LiveDeskCoordinator:
             last_sent = 0.0
             last_heartbeat = 0.0
             last_semantic: tuple[object, ...] | None = None
+            icon_rejected = False
             try:
                 while generation == self._generation and not self._suspended:
                     snapshot = await self._capture.capture(
                         include_media=configuration.supports_media_timeline
                     )
+                    if icon_rejected:
+                        snapshot = _without_application_icon(snapshot)
                     semantic = snapshot.semantic_fingerprint()
                     now = time.monotonic()
                     due = last_heartbeat == 0.0 or now - last_heartbeat >= heartbeat
@@ -188,10 +192,32 @@ class LiveDeskCoordinator:
                             snapshot = await self._capture.capture(
                                 include_media=configuration.supports_media_timeline
                             )
+                            if icon_rejected:
+                                snapshot = _without_application_icon(snapshot)
                             semantic = snapshot.semantic_fingerprint()
                         assert self._writer is not None
                         last_sent = time.monotonic()
-                        await self._writer.replace(snapshot)
+                        try:
+                            await self._writer.replace(snapshot)
+                        except ResponseFailure as error:
+                            if (
+                                error.error.status_code == 422
+                                and error.error.code
+                                == "COMPANION_ICON_HOST_NOT_ALLOWED"
+                                and snapshot.application is not None
+                                and snapshot.application.icon_url is not None
+                            ):
+                                icon_rejected = True
+                                snapshot = _without_application_icon(snapshot)
+                                semantic = snapshot.semantic_fingerprint()
+                                network_log.warning(
+                                    "服务器拒绝软件图标域名（HTTP 422，"
+                                    "COMPANION_ICON_HOST_NOT_ALLOWED）；"
+                                    "本次连接已自动禁用软件图标并继续上报"
+                                )
+                                await self._writer.replace(snapshot)
+                            else:
+                                raise
                         presence_log.info(
                             "Presence 已上报：可见性=%s 应用=%s 媒体=%s",
                             snapshot.availability.value,
@@ -208,6 +234,15 @@ class LiveDeskCoordinator:
                 return
             except asyncio.CancelledError:
                 raise
+            except ResponseFailure as error:
+                self._set_state(RuntimeState.DEGRADED)
+                network_log.warning(
+                    "Presence 请求被服务器拒绝：HTTP %d，错误代码=%s",
+                    error.error.status_code,
+                    error.error.code or "未知",
+                )
+                await self._discard_client()
+                await self._delay_or_refresh(30)
             except Exception as error:
                 self._set_state(RuntimeState.DEGRADED)
                 network_log.warning("Presence 连接中断：%s", type(error).__name__)
@@ -243,3 +278,15 @@ class LiveDeskCoordinator:
 
     def _set_state(self, state: RuntimeState) -> None:
         self._on_state(state)
+
+
+def _without_application_icon(
+    snapshot: SanitizedPresenceSnapshot,
+) -> SanitizedPresenceSnapshot:
+    application = snapshot.application
+    if application is None or application.icon_url is None:
+        return snapshot
+    return replace(
+        snapshot,
+        application=replace(application, icon_url=None),
+    )

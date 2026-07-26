@@ -65,13 +65,15 @@ class PresenceCapture:
             defaults = self._store.load_privacy_defaults()
             rules = self._store.load_rules()
             sensitive_rules = self._store.load_sensitive_rules()
-            privacy_key = (defaults, rules, sensitive_rules)
+            icon_template = self._store.load_icon_template()
+            privacy_key = (defaults, rules, sensitive_rules, icon_template)
             if self._privacy_evaluator is None or privacy_key != self._privacy_key:
                 self._privacy_key = privacy_key
                 self._privacy_evaluator = PrivacyEvaluator(
                     defaults,
                     rules,
                     sensitive_rules,
+                    icon_template,
                 )
             evaluator = self._privacy_evaluator
             evaluator.reset_diagnostics()

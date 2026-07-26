@@ -72,8 +72,13 @@ def _gui_main(background: bool) -> int:
     logs = ProcessLogService(identity.data_directory / "logs")
     logs.install()
     logging_settings = store.load_logging_settings()
-    logs.set_file_enabled(logging_settings.file_enabled)
-    logs.set_vrchat_debug_enabled(logging_settings.vrchat_debug_enabled)
+    logs.set_master_enabled(logging_settings.master_enabled)
+    logs.set_file_enabled(
+        logging_settings.master_enabled and logging_settings.file_enabled
+    )
+    logs.set_vrchat_debug_enabled(
+        logging_settings.master_enabled and logging_settings.vrchat_debug_enabled
+    )
     credentials = WindowsCredentialStore(identity.credential_service)
     vrchat_credentials = WindowsVRChatCredentialStore(identity.credential_service)
     media = WinRTMediaProvider()

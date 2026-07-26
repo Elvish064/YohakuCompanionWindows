@@ -2,11 +2,14 @@
 
 本项目改自 [YohakuCompanion](https://github.com/Innei/YohakuCompanion), 在Codex辅助下使用pyhton重构了一个适用于Windows的客户端
 
+> [!NOTE]
+> 本项目目前为自用，含大量魔改内容和不稳定功能。
+
 ---
 
 Yohaku Companion Windows 是适用于 Windows 10/11 的 Yohaku Live Desk 客户端。它使用 Python、PySide6 和 Companion Protocol v2 直接连接 Yohaku Core，在明确征得用户同意后发布当前前台应用、可选窗口标题、系统媒体元数据和播放时间线。
 
-当前客户端版本为 **1.7.10**，界面语言为简体中文。
+当前客户端版本为 **1.7.12**，界面语言为简体中文。
 
 ## 功能概览
 
@@ -17,7 +20,9 @@ Yohaku Companion Windows 是适用于 Windows 10/11 的 Yohaku Live Desk 客户�
 - 应用、窗口标题和媒体可以分别继承默认规则、分享或隐藏，并支持公开别名。
 - 正则敏感词规则支持图形化构建、高级表达式、字段范围、三种处理动作、排序和 5ms 超时保护。
 - 可选 VRChat 集成可从本地 Discord RPC 捕获 VRChat/VRCX Activity，用净化后的世界名称替换标题，并上传白名单状态。
-- 内置运行与上报日志中心，支持筛选、搜索、复制和可选的按日文件日志。
+- 内置运行与上报日志中心，支持总开关、筛选、搜索、复制和可选的按日文件日志。
+- 日志页提供独立的自定义测试广播，可在 Live Desk 关闭时验证完整 Presence v2 数据。
+- 支持活动标签、手工媒体封面 URL，以及由全局前后缀和应用规则文件名拼接的软件图标。
 - 设备令牌仅保存在 Windows Credential Locker，不提供明文文件回退。
 - SQLite 事务保存非秘密配置及设备序列，避免崩溃后复用序列。
 - 监听 Windows 锁屏、休眠和恢复事件；无法建立锁屏监听时拒绝开启发布。
@@ -31,10 +36,10 @@ Yohaku Companion Windows 是适用于 Windows 10/11 的 Yohaku Live Desk 客户�
 - Slack、Discord 社交状态发布或云端机器人集成（VRChat 功能只监听本机 Discord RPC 管道）；
 - Legacy MixSpace 传输；
 - 历史统计、Moments 或阅读会话；
-- 媒体封面上传和播放链接；
+- 自动下载、缓存、哈希或托管媒体封面；
 - 安装器、代码签名、自动更新或 ARM64 构建。
 
-即使服务器声明支持媒体封面或播放链接，客户端也只会发送显式 JSON `null`。
+客户端不会从 GSMTC、QQ 音乐或网易云音乐自动提取封面。媒体播放器规则可以手工指定符合 Yohaku 校验格式的封面 URL；播放链接只在测试广播中开放。
 
 ## 系统要求
 
@@ -161,6 +166,12 @@ curl.exe -i http://192.168.3.36:2333/api/v3/companion/capabilities
 
 “显示别名”只改变对外公开的应用名称，不会改变应用识别标识。“自定义标题”用于为单个应用指定固定公开标题；只有全局窗口标题来源和该应用的标题规则均允许时才生效。标题优先级为“自定义标题 → VRChat 世界名称 → 普通窗口标题”，因此设置自定义标题后不会读取原始窗口标题。自定义标题仍会经过 NFC 规范化、长度限制和窗口标题敏感词规则。
 
+扩展列还可以填写活动 Key、活动说明、软件图标文件名和媒体封面 URL。活动 Key 只能使用小写字母开头，并包含小写字母、数字、点或连字符；活动说明继续经过窗口标题敏感词规则。
+
+启用“软件图标 URL 模板”后，客户端按“固定 HTTPS 前缀 + 规则中的文件名 + 固定后缀”拼接图标。例如前缀为 `https://cdn.example.com/assets/icons/`、文件名为 `vscode`、后缀为 `.webp` 时，上报 `https://cdn.example.com/assets/icons/vscode.webp`。前缀需要自行包含结尾的 `/`；文件名不能包含路径、查询参数、Fragment、百分号转义或 `..`。
+
+媒体封面只接受手工 URL，格式必须为 `https://.../cover.webp?v=<64位小写SHA-256>`。客户端不会读取或下载播放器封面。
+
 应用规则、敏感词规则和日志中的所有表格列均支持拖动表头分隔线调整宽度。
 
 ### 敏感词规则
@@ -215,11 +226,21 @@ API 密匙使用独立的 Windows Credential Locker 账户保存。界面不会�
 
 “日志”标签页、未配对页面和托盘菜单均可打开日志。内存中最多保留最近 1000 条，支持按级别、类别和文本筛选，以及暂停刷新、自动滚动、复制和清空。
 
+关闭“启用日志记录”后，客户端会清空内存日志、关闭文件日志并停止表格刷新；包括警告和错误在内的新记录都会被丢弃。文件日志和 VRChat 调试选项会保留，重新打开总开关后恢复使用。
+
 文件日志默认关闭。启用后写入当前应用身份目录的 `logs\companion.log`，午夜轮转，仅保留一个旧文件。Debug 与 Release 使用不同目录。界面和文件使用同一份脱敏记录；日志不会记录 Bearer token、VRC API 密匙、配对码、请求 Header、原始窗口标题、原始 Activity 或响应正文。
 
 “记录 VRChat 调试日志”默认关闭，仅排查集成问题时开启。关闭时仍会保留警告和错误，但不会为高频 Activity 或成功上传创建日志。开启后 Activity 日志按五秒聚合，未占用的 Discord 管道最多每 30 秒记录一次；日志表格也只在可见且内容变化时刷新。
 
 VRC Activity 上传采用“最新状态优先”：突发更新会合并为队列中的最新一项，发送频率最多每秒一次，不会在 VRChat 长时间运行后追赶过期状态。
+
+### 自定义测试广播
+
+日志页的“测试广播”子页可以填写应用、窗口、活动、媒体、封面、播放器、播放链接和时间线字段，并指定 5 秒至 24 小时的广播时间。它只要求设备已经配对，不要求 Live Desk 已开启。
+
+“应用现有敏感词规则”默认开启。关闭时只进行协议与 URL 安全校验，最终 JSON 预览会显示实际发送的数据。播放链接只在测试广播中开放，并仅接受 QQ 音乐 `https://y.qq.com/n/ryqq/songDetail/<songmid>` 或网易云音乐 `https://music.163.com/song?id=<数字ID>`。
+
+如果普通 Live Desk 正在运行，测试会先清除并关闭它。测试期间根据服务器租约自动续期，播放进度按锚点自然推进；到期、手动停止、锁屏、休眠或退出时会清除测试 Presence。测试结束不会自动恢复普通发布，必须重新检查净化预览并明确开启 Live Desk。
 
 ## 媒体时间线
 
@@ -358,11 +379,11 @@ cd YohakuCompanionWindows
 
 ### 能力检查返回 HTTP 403
 
-先直接请求完整能力 URL。如果 `curl.exe` 返回 200 而客户端返回 403，请确认运行的是最新客户端；客户端会发送 `YohakuCompanion/1.7.10 (Windows)` User-Agent，并对局域网 HTTP 绕过环境代理。还应检查反向代理、WAF 或爬虫防护是否按 User-Agent、来源或路径拦截。
+先直接请求完整能力 URL。如果 `curl.exe` 返回 200 而客户端返回 403，请确认运行的是最新客户端；客户端会发送 `YohakuCompanion/1.7.12 (Windows)` User-Agent，并对局域网 HTTP 绕过环境代理。还应检查反向代理、WAF 或爬虫防护是否按 User-Agent、来源或路径拦截。
 
 ### VRChat 集成提示缺少 pywin32
 
-激活 conda 环境后重新执行 `python -m pip install -e ".[dev]"`。版本 1.7.10 精确依赖 `pywin32==312`；更新依赖后需要重新构建 EXE。
+激活 conda 环境后重新执行 `python -m pip install -e ".[dev]"`。版本 1.7.12 精确依赖 `pywin32==312`；更新依赖后需要重新构建 EXE。
 
 ### VRC Activity 没有出现
 

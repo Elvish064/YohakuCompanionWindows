@@ -217,11 +217,24 @@ def make_presence_request(
         _validate_text(app.display_name, "data.application.displayName", 120)
         if app.window_title is not None:
             _validate_text(app.window_title, "data.application.window.title", 500)
+        if app.activity_custom_label is not None:
+            _validate_text(
+                app.activity_custom_label,
+                "data.application.activity.customLabel",
+                80,
+            )
         application = {
             "displayName": app.display_name,
-            "activity": None,
+            "activity": (
+                None
+                if app.activity_key is None and app.activity_custom_label is None
+                else {
+                    "key": app.activity_key,
+                    "customLabel": app.activity_custom_label,
+                }
+            ),
             "window": None if app.window_title is None else {"title": app.window_title},
-            "icon": None,
+            "icon": None if app.icon_url is None else {"url": app.icon_url},
         }
 
     media: dict[str, Any] | None = None
@@ -260,9 +273,11 @@ def make_presence_request(
             },
         }
         if configuration.supports_media_artwork:
-            media["artwork"] = None
+            media["artwork"] = (
+                None if source.artwork_url is None else {"url": source.artwork_url}
+            )
         if configuration.supports_media_playback_links:
-            media["link"] = None
+            media["link"] = None if source.link_url is None else {"url": source.link_url}
 
     lease = min(
         max(requested_lease_seconds, configuration.minimum_lease_seconds),
@@ -559,8 +574,14 @@ def _validate_public_application(value: Any) -> None:
     for key in ("activity", "window", "icon"):
         if key not in value:
             raise ProtocolError(f"missing public application field: {key}")
-    if value["activity"] is not None and not isinstance(value["activity"], dict):
-        raise ProtocolError("invalid public activity")
+    activity = value["activity"]
+    if activity is not None:
+        if not isinstance(activity, dict):
+            raise ProtocolError("invalid public activity")
+        if "key" not in activity or "customLabel" not in activity:
+            raise ProtocolError("missing public activity field")
+        _nullable_text(activity["key"], "public activity key", 64)
+        _nullable_text(activity["customLabel"], "public activity label", 80)
     window = value["window"]
     if window is not None:
         if not isinstance(window, dict):

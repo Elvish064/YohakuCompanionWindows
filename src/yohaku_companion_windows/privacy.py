@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import regex
 
 from .domain import (
+    ApplicationIconTemplateSettings,
     ApplicationRule,
     PlaybackState,
     PrivacyDefaults,
@@ -20,6 +21,7 @@ from .domain import (
     SensitiveTextRule,
     ShareMode,
     SourceSettings,
+    normalize_https_url,
     normalize_text,
 )
 
@@ -30,12 +32,16 @@ class ApplicationDecision:
     shares_window_title: bool
     alias: str | None
     custom_title: str | None
+    icon_url: str | None
+    activity_key: str | None
+    activity_custom_label: str | None
 
 
 @dataclass(frozen=True, slots=True)
 class MediaDecision:
     shares_media: bool
     alias: str | None
+    artwork_url: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,8 +57,10 @@ class PrivacyEvaluator:
         defaults: PrivacyDefaults,
         rules: tuple[ApplicationRule, ...],
         sensitive_rules: tuple[SensitiveTextRule, ...] = (),
+        icon_template: ApplicationIconTemplateSettings | None = None,
     ) -> None:
         self._defaults = defaults
+        self._icon_template = icon_template or ApplicationIconTemplateSettings()
         self._rules = {rule.normalized().identifier: rule.normalized() for rule in rules}
         self._sensitive_rules = tuple(
             _CompiledSensitiveRule.from_rule(rule.normalized())
@@ -78,6 +86,16 @@ class PrivacyEvaluator:
             None if rule is None else rule.window_title,
             self._defaults.window_title,
         )
+        icon_url = None
+        if (
+            shares_application
+            and rule is not None
+            and rule.icon_filename
+            and self._icon_template.enabled
+        ):
+            icon_url = normalize_https_url(
+                f"{self._icon_template.prefix}{rule.icon_filename}{self._icon_template.suffix}"
+            )
         return ApplicationDecision(
             shares_application=shares_application,
             shares_window_title=shares_window,
@@ -91,6 +109,13 @@ class PrivacyEvaluator:
                 if not shares_window or rule is None
                 else normalize_text(rule.custom_title, 500)
             ),
+            icon_url=icon_url,
+            activity_key=None if rule is None else rule.activity_key,
+            activity_custom_label=(
+                None
+                if not shares_application or rule is None
+                else rule.activity_custom_label
+            ),
         )
 
     def media_decision(self, identifier: str) -> MediaDecision:
@@ -102,6 +127,9 @@ class PrivacyEvaluator:
         return MediaDecision(
             shares_media=shares_media,
             alias=None if not shares_media or rule is None else normalize_text(rule.alias, 120),
+            artwork_url=(
+                None if not shares_media or rule is None else rule.media_artwork_url
+            ),
         )
 
     def filter_application(
@@ -114,6 +142,13 @@ class PrivacyEvaluator:
             SensitiveField.APPLICATION_NAME: value.display_name,
             SensitiveField.WINDOW_TITLE: value.window_title,
         }
+        activity_label = self.filter_text(
+            value.activity_custom_label,
+            SensitiveField.WINDOW_TITLE,
+            80,
+        )
+        if activity_label.hide_context:
+            return None
         if self._filter_fields(fields, application_context=True):
             return None
         display_name = fields[SensitiveField.APPLICATION_NAME]
@@ -122,6 +157,9 @@ class PrivacyEvaluator:
         return SanitizedApplicationPresence(
             display_name=display_name,
             window_title=fields[SensitiveField.WINDOW_TITLE],
+            icon_url=value.icon_url,
+            activity_key=value.activity_key,
+            activity_custom_label=activity_label.value,
         )
 
     def filter_media(
@@ -151,6 +189,8 @@ class PrivacyEvaluator:
             album=fields[SensitiveField.MEDIA_ALBUM],
             player_display_name=fields[SensitiveField.PLAYER_NAME],
             playback=value.playback,
+            artwork_url=value.artwork_url,
+            link_url=value.link_url,
         )
 
     def filter_text(
@@ -240,7 +280,13 @@ def sanitize_application(
     window_title = None
     if sources.window_titles and decision.shares_window_title:
         window_title = normalize_text(captured_window_title, 500)
-    return SanitizedApplicationPresence(display_name, window_title)
+    return SanitizedApplicationPresence(
+        display_name,
+        window_title,
+        decision.icon_url,
+        decision.activity_key,
+        decision.activity_custom_label,
+    )
 
 
 def sanitize_media(
@@ -271,6 +317,7 @@ def sanitize_media(
             sampled_at=source.sampled_at.astimezone(UTC),
             rate=source.rate if source.state is PlaybackState.PLAYING else 0.0,
         ),
+        artwork_url=decision.artwork_url,
     )
 
 

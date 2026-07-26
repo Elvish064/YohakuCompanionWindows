@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID, uuid4
 
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QIcon
@@ -24,6 +26,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
+    QSpinBox,
     QStackedWidget,
     QSystemTrayIcon,
     QTableWidget,
@@ -34,10 +38,18 @@ from PySide6.QtWidgets import (
 )
 
 from .domain import (
+    ApplicationIconTemplateSettings,
     ApplicationRule,
+    CustomBroadcastSpec,
     LoggingSettings,
+    MediaKind,
+    PlaybackState,
     PrivacyDefaults,
     RuntimeState,
+    SanitizedApplicationPresence,
+    SanitizedMediaPlayback,
+    SanitizedMediaPresence,
+    SanitizedPresenceSnapshot,
     SensitiveAction,
     SensitiveTextRule,
     ServiceViewState,
@@ -111,6 +123,8 @@ class LogPanel(QWidget):
         actions.addWidget(open_button)
         if service is not None:
             logging_settings = service.store.load_logging_settings()
+            self.master_logging = QCheckBox("启用日志记录")
+            self.master_logging.setChecked(logging_settings.master_enabled)
             self.file_logging = QCheckBox("写入按日文件日志")
             self.file_logging.setChecked(logging_settings.file_enabled)
             self.vrchat_debug_logging = QCheckBox("记录 VRChat 调试日志")
@@ -120,8 +134,10 @@ class LogPanel(QWidget):
             self.vrchat_debug_logging.setChecked(
                 logging_settings.vrchat_debug_enabled
             )
+            self.master_logging.toggled.connect(self._master_logging_changed)
             self.file_logging.toggled.connect(self._save_logging_settings)
             self.vrchat_debug_logging.toggled.connect(self._save_logging_settings)
+            actions.addWidget(self.master_logging)
             actions.addWidget(self.file_logging)
             actions.addWidget(self.vrchat_debug_logging)
         actions.addStretch()
@@ -133,9 +149,18 @@ class LogPanel(QWidget):
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self.refresh)
         self._timer.start()
+        if service is not None:
+            self._master_logging_changed(
+                logging_settings.master_enabled,
+                save=False,
+            )
         self.refresh()
 
     def refresh(self) -> None:
+        if self._service is not None and not self.master_logging.isChecked():
+            if self.table.rowCount():
+                self.table.setRowCount(0)
+            return
         if self.pause_refresh.isChecked() or not self.isVisible():
             return
         entries = self._logs.entries()
@@ -210,9 +235,26 @@ class LogPanel(QWidget):
                     LoggingSettings(
                         self.file_logging.isChecked(),
                         self.vrchat_debug_logging.isChecked(),
+                        self.master_logging.isChecked(),
                     )
                 )
             )
+
+    def _master_logging_changed(self, enabled: bool, *, save: bool = True) -> None:
+        self.file_logging.setEnabled(enabled)
+        self.vrchat_debug_logging.setEnabled(enabled)
+        self.level_filter.setEnabled(enabled)
+        self.category_filter.setEnabled(enabled)
+        self.search_edit.setEnabled(enabled)
+        self.pause_refresh.setEnabled(enabled)
+        self.auto_scroll.setEnabled(enabled)
+        if enabled:
+            self._timer.start()
+        else:
+            self._timer.stop()
+            self.table.setRowCount(0)
+        if save:
+            self._save_logging_settings(enabled)
 
 
 class LogWindow(QDialog):
@@ -221,12 +263,279 @@ class LogWindow(QDialog):
         self.setWindowTitle("Yohaku Companion 日志")
         self.resize(900, 560)
         layout = QVBoxLayout(self)
-        layout.addWidget(LogPanel(logs, service, self))
+        tabs = QTabWidget()
+        tabs.addTab(LogPanel(logs, service, self), "日志记录")
+        tabs.addTab(CustomBroadcastPanel(service, self), "测试广播")
+        layout.addWidget(tabs)
 
     def show_and_raise(self) -> None:
         self.show()
         self.raise_()
         self.activateWindow()
+
+
+class CustomBroadcastPanel(QWidget):
+    def __init__(self, service: ApplicationService, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.service = service
+        root = QVBoxLayout(self)
+        notice = QLabel(
+            "测试广播不要求 Live Desk 已开启；开始时会接管 Presence，结束后不会自动恢复。"
+        )
+        notice.setWordWrap(True)
+        root.addWidget(notice)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        form = QFormLayout(body)
+        self.duration = QSpinBox()
+        self.duration.setRange(5, 86_400)
+        self.duration.setValue(60)
+        self.duration.setSuffix(" 秒")
+        self.apply_privacy = QCheckBox("应用现有敏感词规则")
+        self.apply_privacy.setChecked(True)
+        form.addRow("持续时间", self.duration)
+        form.addRow("", self.apply_privacy)
+
+        self.app_name = QLineEdit()
+        self.app_icon = QLineEdit()
+        self.app_title = QLineEdit()
+        self.activity_key = QLineEdit()
+        self.activity_label = QLineEdit()
+        for label, app_widget in (
+            ("应用名称", self.app_name),
+            ("应用图标 HTTPS URL", self.app_icon),
+            ("窗口标题", self.app_title),
+            ("活动 Key", self.activity_key),
+            ("活动说明", self.activity_label),
+        ):
+            form.addRow(label, app_widget)
+
+        self.media_session = QLineEdit(str(uuid4()))
+        self.media_kind = QComboBox()
+        self.media_kind.addItems([item.value for item in MediaKind])
+        self.media_title = QLineEdit()
+        self.media_artist = QLineEdit()
+        self.media_album = QLineEdit()
+        self.media_artwork = QLineEdit()
+        self.media_player = QLineEdit()
+        self.media_link = QLineEdit()
+        for label, media_widget in (
+            ("媒体会话 ID", self.media_session),
+            ("媒体类型", self.media_kind),
+            ("媒体标题", self.media_title),
+            ("艺术家", self.media_artist),
+            ("专辑", self.media_album),
+            ("封面 URL", self.media_artwork),
+            ("播放器", self.media_player),
+            ("播放链接", self.media_link),
+        ):
+            form.addRow(label, media_widget)
+
+        self.playback_state = QComboBox()
+        self.playback_state.addItems(["paused", "playing"])
+        self.duration_ms = QSpinBox()
+        self.duration_ms.setRange(0, 2_147_483_647)
+        self.position_ms = QSpinBox()
+        self.position_ms.setRange(0, 2_147_483_647)
+        self.rate = QComboBox()
+        self.rate.addItems(["0", "0.5", "1", "1.5", "2", "4"])
+        form.addRow("播放状态", self.playback_state)
+        form.addRow("媒体总时长（毫秒）", self.duration_ms)
+        form.addRow("当前位置（毫秒）", self.position_ms)
+        form.addRow("播放倍率", self.rate)
+        scroll.setWidget(body)
+        root.addWidget(scroll, 1)
+
+        self.preview = QPlainTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setPlaceholderText("点击“验证并预览”查看最终净化数据")
+        self.preview.setMaximumHeight(210)
+        root.addWidget(self.preview)
+        controls = QHBoxLayout()
+        fill = QPushButton("从当前净化预览填充")
+        validate = QPushButton("验证并预览")
+        self.start_button = QPushButton("开始测试广播")
+        self.stop_button = QPushButton("立即停止")
+        self.stop_button.setEnabled(False)
+        self.status = QLabel("未运行")
+        fill.clicked.connect(self._fill_current)
+        validate.clicked.connect(self._validate)
+        self.start_button.clicked.connect(self._start)
+        self.stop_button.clicked.connect(self._stop)
+        for control_widget in (
+            fill,
+            validate,
+            self.start_button,
+            self.stop_button,
+            self.status,
+        ):
+            controls.addWidget(control_widget)
+        controls.addStretch()
+        root.addLayout(controls)
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._refresh_status)
+        self._timer.start()
+
+    def _snapshot(self) -> SanitizedPresenceSnapshot:
+        application = None
+        if self.app_name.text().strip():
+            application = SanitizedApplicationPresence(
+                self.app_name.text(),
+                self.app_title.text() or None,
+                self.app_icon.text() or None,
+                self.activity_key.text() or None,
+                self.activity_label.text() or None,
+            )
+        media = None
+        if self.media_title.text().strip() or self.media_artist.text().strip():
+            state = PlaybackState(self.playback_state.currentText())
+            rate = float(self.rate.currentText())
+            if state is PlaybackState.PAUSED:
+                rate = 0
+            elif rate <= 0:
+                rate = 1
+            duration = self.duration_ms.value() / 1000 if self.duration_ms.value() else None
+            position = self.position_ms.value() / 1000 if self.position_ms.value() else 0
+            media = SanitizedMediaPresence(
+                _parse_media_session(self.media_session.text().strip()),
+                MediaKind(self.media_kind.currentText()),
+                self.media_title.text() or None,
+                self.media_artist.text() or None,
+                self.media_album.text() or None,
+                self.media_player.text() or None,
+                SanitizedMediaPlayback(
+                    state,
+                    duration,
+                    position,
+                    datetime.now(UTC),
+                    rate,
+                ),
+                self.media_artwork.text() or None,
+                self.media_link.text() or None,
+            )
+        snapshot = SanitizedPresenceSnapshot(datetime.now(UTC), application, media)
+        return self.service.prepare_custom_snapshot(
+            snapshot,
+            self.apply_privacy.isChecked(),
+        )
+
+    def _projection(self, snapshot: SanitizedPresenceSnapshot) -> dict[str, Any]:
+        app = snapshot.application
+        media = snapshot.media
+        return {
+            "availability": snapshot.availability.value,
+            "application": None if app is None else {
+                "displayName": app.display_name,
+                "icon": None if app.icon_url is None else {"url": app.icon_url},
+                "window": None if app.window_title is None else {"title": app.window_title},
+                "activity": None if not (app.activity_key or app.activity_custom_label) else {
+                    "key": app.activity_key,
+                    "customLabel": app.activity_custom_label,
+                },
+            },
+            "media": None if media is None else {
+                "sessionId": str(media.session_id),
+                "kind": media.kind.value,
+                "title": media.title,
+                "artist": media.artist,
+                "album": media.album,
+                "artwork": None if media.artwork_url is None else {"url": media.artwork_url},
+                "player": None if media.player_display_name is None else {
+                    "displayName": media.player_display_name
+                },
+                "link": None if media.link_url is None else {"url": media.link_url},
+                "playback": {
+                    "state": media.playback.state.value,
+                    "durationMs": (
+                        None
+                        if media.playback.duration_seconds is None
+                        else round(media.playback.duration_seconds * 1000)
+                    ),
+                    "positionMs": (
+                        None
+                        if media.playback.position_seconds is None
+                        else round(media.playback.position_seconds * 1000)
+                    ),
+                    "anchorAt": media.playback.sampled_at.isoformat(
+                        timespec="milliseconds"
+                    ).replace("+00:00", "Z"),
+                    "rate": media.playback.rate,
+                },
+            },
+        }
+
+    def _validate(self) -> SanitizedPresenceSnapshot | None:
+        try:
+            snapshot = self._snapshot()
+            self.preview.setPlainText(
+                json.dumps(self._projection(snapshot), ensure_ascii=False, indent=2)
+            )
+            return snapshot
+        except Exception as error:
+            QMessageBox.warning(self, "测试数据无效", str(error))
+            return None
+
+    def _start(self) -> None:
+        snapshot = self._validate()
+        if snapshot is None:
+            return
+        spec = CustomBroadcastSpec(
+            snapshot,
+            self.duration.value(),
+            self.apply_privacy.isChecked(),
+        )
+        asyncio.create_task(self._start_async(spec))
+
+    async def _start_async(self, spec: CustomBroadcastSpec) -> None:
+        try:
+            await self.service.start_custom_broadcast(spec)
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+        except Exception as error:
+            QMessageBox.warning(self, "无法开始测试广播", str(error))
+
+    def _stop(self) -> None:
+        asyncio.create_task(self.service.stop_custom_broadcast())
+
+    def _refresh_status(self) -> None:
+        controller = self.service.custom_broadcast
+        if controller.running:
+            self.status.setText(f"正在广播，剩余 {controller.remaining_seconds} 秒")
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+        else:
+            self.status.setText(controller.status)
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+
+    def _fill_current(self) -> None:
+        snapshot = self.service.state.preview
+        if snapshot is None:
+            QMessageBox.information(self, "没有预览", "请先在 Live Desk 页刷新净化预览")
+            return
+        app, media = snapshot.application, snapshot.media
+        if app is not None:
+            self.app_name.setText(app.display_name)
+            self.app_icon.setText(app.icon_url or "")
+            self.app_title.setText(app.window_title or "")
+            self.activity_key.setText(app.activity_key or "")
+            self.activity_label.setText(app.activity_custom_label or "")
+        if media is not None:
+            self.media_session.setText(str(media.session_id))
+            self.media_kind.setCurrentText(media.kind.value)
+            self.media_title.setText(media.title or "")
+            self.media_artist.setText(media.artist or "")
+            self.media_album.setText(media.album or "")
+            self.media_artwork.setText(media.artwork_url or "")
+            self.media_player.setText(media.player_display_name or "")
+            self.media_link.setText(media.link_url or "")
+            self.playback_state.setCurrentText(media.playback.state.value)
+            self.duration_ms.setValue(round((media.playback.duration_seconds or 0) * 1000))
+            self.position_ms.setValue(round((media.playback.position_seconds or 0) * 1000))
+            self.rate.setCurrentText(str(media.playback.rate))
+        self._validate()
 
 
 class SettingsWindow(QMainWindow):
@@ -388,7 +697,10 @@ class SettingsWindow(QMainWindow):
         tabs.addTab(self._make_privacy_tab(), "隐私")
         tabs.addTab(self._make_vrchat_tab(), "VRChat 集成")
         if self.service.logs is not None:
-            tabs.addTab(LogPanel(self.service.logs, self.service), "日志")
+            log_tabs = QTabWidget()
+            log_tabs.addTab(LogPanel(self.service.logs, self.service), "日志记录")
+            log_tabs.addTab(CustomBroadcastPanel(self.service), "测试广播")
+            tabs.addTab(log_tabs, "日志")
         tabs.addTab(self._make_general_tab(), "常规")
         container = QWidget()
         layout = QVBoxLayout(container)
@@ -455,14 +767,17 @@ class SettingsWindow(QMainWindow):
         grid.addRow(self._source_apps, self._default_apps)
         grid.addRow(self._source_titles, self._default_titles)
         grid.addRow(self._source_media, self._default_media)
-        self._rules = QTableWidget(0, 7)
+        self._rules = QTableWidget(0, 11)
         self._rules.setHorizontalHeaderLabels(
-            ["应用", "标识", "应用", "标题", "媒体", "显示别名", "自定义标题"]
+            [
+                "应用", "标识", "应用", "标题", "媒体", "显示别名", "自定义标题",
+                "图标文件名", "活动 Key", "活动说明", "媒体封面 URL",
+            ]
         )
         self._rules.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         _configure_resizable_header(
             self._rules,
-            (130, 190, 80, 80, 80, 140, 220),
+            (130, 190, 80, 80, 80, 140, 220, 130, 120, 180, 260),
         )
         custom_title_header = self._rules.horizontalHeaderItem(6)
         if custom_title_header is not None:
@@ -471,6 +786,16 @@ class SettingsWindow(QMainWindow):
             )
         app_rules_page = QWidget()
         app_rules_layout = QVBoxLayout(app_rules_page)
+        icon_group = QGroupBox("软件图标 URL 模板")
+        icon_form = QFormLayout(icon_group)
+        self._icon_template_enabled = QCheckBox("启用前缀与后缀拼接")
+        self._icon_prefix = QLineEdit()
+        self._icon_prefix.setPlaceholderText("https://cdn.example.com/assets/icons/")
+        self._icon_suffix = QLineEdit(".webp")
+        icon_form.addRow(self._icon_template_enabled)
+        icon_form.addRow("固定 URL 前缀", self._icon_prefix)
+        icon_form.addRow("固定 URL 后缀", self._icon_suffix)
+        app_rules_layout.addWidget(icon_group)
         app_rules_layout.addWidget(QLabel("应用规则（隐藏优先于显示别名）"))
         app_rules_layout.addWidget(self._rules)
 
@@ -633,12 +958,16 @@ class SettingsWindow(QMainWindow):
     def _load_global_privacy(self) -> None:
         sources = self.service.store.load_sources()
         defaults = self.service.store.load_privacy_defaults()
+        icon_template = self.service.store.load_icon_template()
         self._source_apps.setChecked(sources.applications)
         self._source_titles.setChecked(sources.window_titles)
         self._source_media.setChecked(sources.media)
         self._default_apps.setChecked(defaults.application)
         self._default_titles.setChecked(defaults.window_title)
         self._default_media.setChecked(defaults.media)
+        self._icon_template_enabled.setChecked(icon_template.enabled)
+        self._icon_prefix.setText(icon_template.prefix)
+        self._icon_suffix.setText(icon_template.suffix)
 
     def _sync_privacy_table(self, state: ServiceViewState) -> None:
         rules = {rule.identifier: rule for rule in self.service.store.load_rules()}
@@ -668,6 +997,14 @@ class SettingsWindow(QMainWindow):
                 self._rules.setCellWidget(row, column, combo)
             self._rules.setItem(row, 5, QTableWidgetItem(rule.alias or ""))
             self._rules.setItem(row, 6, QTableWidgetItem(rule.custom_title or ""))
+            self._rules.setItem(row, 7, QTableWidgetItem(rule.icon_filename or ""))
+            self._rules.setItem(row, 8, QTableWidgetItem(rule.activity_key or ""))
+            self._rules.setItem(
+                row, 9, QTableWidgetItem(rule.activity_custom_label or "")
+            )
+            self._rules.setItem(
+                row, 10, QTableWidgetItem(rule.media_artwork_url or "")
+            )
 
     def _render_sensitive_rules(self, selected_row: int | None = None) -> None:
         self._sensitive_table.setRowCount(0)
@@ -795,6 +1132,10 @@ class SettingsWindow(QMainWindow):
                     media=_combo_mode(self._rules.cellWidget(row, 4)),
                     alias=_table_text(self._rules, row, 5),
                     custom_title=_table_text(self._rules, row, 6),
+                    icon_filename=_table_text(self._rules, row, 7),
+                    activity_key=_table_text(self._rules, row, 8),
+                    activity_custom_label=_table_text(self._rules, row, 9),
+                    media_artwork_url=_table_text(self._rules, row, 10),
                 )
             )
         await self.service.save_privacy(
@@ -810,6 +1151,11 @@ class SettingsWindow(QMainWindow):
             ),
             tuple(rules),
             tuple(self._sensitive_rules),
+            ApplicationIconTemplateSettings(
+                self._icon_template_enabled.isChecked(),
+                self._icon_prefix.text(),
+                self._icon_suffix.text(),
+            ),
         )
         self._sensitive_rules = list(self.service.store.load_sensitive_rules())
         self._render_sensitive_rules()
@@ -1038,3 +1384,10 @@ def _format_duration(value: float | None) -> str:
         if hours
         else f"{minutes}:{seconds:02d}"
     )
+
+
+def _parse_media_session(value: str) -> UUID | str:
+    try:
+        return UUID(value)
+    except ValueError:
+        return value

@@ -54,3 +54,19 @@ def test_vrchat_debug_logs_are_opt_in_but_warnings_remain(tmp_path: Path) -> Non
         assert logs.entries()[-1].message == "aggregated diagnostics"
     finally:
         logs.uninstall()
+
+
+def test_master_switch_drops_memory_and_file_logs(tmp_path: Path) -> None:
+    logs = ProcessLogService(tmp_path)
+    logs.install()
+    logs.set_file_enabled(True)
+    logger = logging.getLogger("yohaku.网络")
+    logger.info("before")
+    logs.set_master_enabled(False)
+    logger.error("must be dropped")
+    assert logs.entries() == ()
+    assert not logs.file_enabled
+    logs.set_master_enabled(True)
+    logger.info("after")
+    assert [entry.message for entry in logs.entries()] == ["after"]
+    logs.uninstall()

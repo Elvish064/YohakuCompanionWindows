@@ -14,11 +14,11 @@ VSVersionInfo(
       StringTable("080404B0", [
         StringStruct("CompanyName", "Innei"),
         StringStruct("FileDescription", "Yohaku Companion Windows"),
-        StringStruct("FileVersion", "1.7.10"),
+        StringStruct("FileVersion", "1.7.12"),
         StringStruct("InternalName", "YohakuCompanion"),
         StringStruct("OriginalFilename", "YohakuCompanion.exe"),
         StringStruct("ProductName", "Yohaku Companion"),
-        StringStruct("ProductVersion", "1.7.10"),
+        StringStruct("ProductVersion", "1.7.12"),
       ])
     ]),
     VarFileInfo([VarStruct("Translation", [2052, 1200])]),
